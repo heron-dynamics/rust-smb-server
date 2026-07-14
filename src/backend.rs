@@ -146,6 +146,13 @@ pub struct BackendCapabilities {
     pub is_read_only: bool,
     /// True iff the backend treats names case-sensitively.
     pub case_sensitive: bool,
+    /// True iff `open()` honours `SmbPath::stream_name()` — storing and
+    /// retrieving a named stream separately from the file's primary data.
+    /// Advertised to clients as `FILE_NAMED_STREAMS` (MS-FSCC §2.5.1) so
+    /// they don't fall back to embedding stream-shaped data (e.g. macOS's
+    /// AFPInfo/Finder-info/xattr writes) into the primary data stream —
+    /// see `docs/SMB_DEFECTS.md` S2/S10 in the prosopon consumer.
+    pub supports_named_streams: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +244,7 @@ impl ShareBackend for NotSupportedBackend {
         BackendCapabilities {
             is_read_only: true,
             case_sensitive: false,
+            supports_named_streams: false,
         }
     }
 }

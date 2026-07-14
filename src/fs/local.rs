@@ -240,11 +240,22 @@ impl ShareBackend for LocalFsBackend {
             return Err(SmbError::AccessDenied);
         }
 
+        if is_streams_control_path(path) {
+            return Err(SmbError::AccessDenied);
+        }
+
         let rel = to_rel_path(path);
         let root = Arc::clone(&self.root);
         let read_only = self.read_only;
         let directory = opts.directory;
         let non_directory = opts.non_directory;
+
+        if let Some(stream) = path.stream_name() {
+            if directory {
+                return Err(SmbError::NameInvalid);
+            }
+            return self.open_stream(&rel, stream, opts).await;
+        }
 
         // For directories, cap-std exposes `open_dir` separately; we don't
         // need an OpenOptions translation in that case.
@@ -369,6 +380,9 @@ impl ShareBackend for LocalFsBackend {
         if self.read_only {
             return Err(SmbError::AccessDenied);
         }
+        if is_streams_control_path(path) {
+            return Err(SmbError::AccessDenied);
+        }
         if path.is_root() {
             // Refusing to delete the share root itself.
             return Err(SmbError::AccessDenied);
@@ -400,6 +414,9 @@ impl ShareBackend for LocalFsBackend {
 
     async fn rename(&self, from: &SmbPath, to: &SmbPath, replace: bool) -> SmbResult<()> {
         if self.read_only {
+            return Err(SmbError::AccessDenied);
+        }
+        if is_streams_control_path(from) || is_streams_control_path(to) {
             return Err(SmbError::AccessDenied);
         }
         if from.is_root() || to.is_root() {
@@ -440,8 +457,113 @@ impl ShareBackend for LocalFsBackend {
             // POSIX filesystems are typically case-sensitive. We don't try to
             // emulate case-insensitive lookup in v1 (see spec §3.4).
             case_sensitive: cfg!(any(target_os = "linux", target_os = "freebsd")),
+            supports_named_streams: true,
         }
     }
+}
+
+impl LocalFsBackend {
+    /// Open a named stream (`file.txt:AFP_AfpInfo`). Streams are stored as
+    /// plain files under a `.smb-streams` sibling directory, mirroring the
+    /// host file's own relative path (`new.txt:AFP_AfpInfo` →
+    /// `.smb-streams/new.txt/AFP_AfpInfo`) — kept out of the client's own
+    /// namespace by `is_streams_control_path` guards on every mutation
+    /// entry point. This is a v1-internal storage convention, not a claim
+    /// of fidelity with any native xattr/resource-fork representation.
+    async fn open_stream(
+        &self,
+        base_rel: &Path,
+        stream: &str,
+        opts: OpenOptions,
+    ) -> SmbResult<Box<dyn Handle>> {
+        let root = Arc::clone(&self.root);
+        let base_rel = base_rel.to_path_buf();
+        let host_exists_and_is_file = {
+            let root = Arc::clone(&root);
+            let base_rel = base_rel.clone();
+            spawn_blocking(move || -> io::Result<bool> {
+                match root.metadata(&base_rel) {
+                    Ok(md) if md.is_dir() => Err(io::Error::from(io::ErrorKind::IsADirectory)),
+                    Ok(_) => Ok(true),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+                    Err(e) => Err(e),
+                }
+            })
+            .await
+            .map_err(join_to_io)
+            .map_err(io_to_smb)?
+            .map_err(io_to_smb)?
+        };
+        if !host_exists_and_is_file {
+            return Err(SmbError::NotFound);
+        }
+
+        let stream_rel = stream_rel_path(&base_rel, stream);
+        let read_only = self.read_only;
+
+        let mut cap_opts = CapOpenOptions::new();
+        match opts.intent {
+            OpenIntent::Open => {
+                cap_opts.read(true).write(opts.write);
+            }
+            OpenIntent::Create => {
+                cap_opts.read(opts.read).write(true).create_new(true);
+            }
+            OpenIntent::Truncate => {
+                cap_opts.read(opts.read).write(true).truncate(true);
+            }
+            OpenIntent::OpenOrCreate => {
+                cap_opts.read(opts.read).write(true).create(true);
+            }
+            OpenIntent::OverwriteOrCreate => {
+                cap_opts
+                    .read(opts.read)
+                    .write(true)
+                    .create(true)
+                    .truncate(true);
+            }
+        }
+
+        let creates = matches!(
+            opts.intent,
+            OpenIntent::Create | OpenIntent::OpenOrCreate | OpenIntent::OverwriteOrCreate
+        );
+        let cap_file = spawn_blocking(move || -> io::Result<cap_std::fs::File> {
+            if creates && let Some(parent) = stream_rel.parent() {
+                root.create_dir_all(parent)?;
+            }
+            root.open_with(&stream_rel, &cap_opts)
+        })
+        .await
+        .map_err(join_to_io)
+        .map_err(io_to_smb)?
+        .map_err(io_to_smb)?;
+
+        let std_file: std::fs::File = cap_file.into_std();
+        Ok(Box::new(LocalHandle::File {
+            name: stream.to_string(),
+            file: Arc::new(std_file),
+            read_only,
+        }))
+    }
+}
+
+/// Streams live under this sibling directory at the share root — never a
+/// name a real client path is allowed to address (see
+/// `is_streams_control_path`).
+const STREAMS_DIR: &str = ".smb-streams";
+
+fn is_streams_control_path(path: &SmbPath) -> bool {
+    path.components()
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(STREAMS_DIR))
+}
+
+fn stream_rel_path(base_rel: &Path, stream: &str) -> PathBuf {
+    let mut out = PathBuf::from(STREAMS_DIR);
+    out.push(base_rel);
+    out.push(stream);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +759,13 @@ impl Handle for LocalHandle {
                             // and we never want to emit invalid Unicode here.
                             continue;
                         };
+                        if name.eq_ignore_ascii_case(STREAMS_DIR) {
+                            // Never surface the stream-storage sidecar
+                            // directory itself; no client path can address
+                            // it (`is_streams_control_path`), so it must
+                            // not appear in listings either.
+                            continue;
+                        }
                         if let Some(p) = pat.as_deref() {
                             // Empty / "*" / "*.*" all mean "match everything"
                             // in DOS-speak.
@@ -1085,5 +1214,126 @@ mod tests {
             .unwrap();
         // 100ns granularity — round-trip should be sub-microsecond.
         assert!(delta < Duration::from_micros(1), "delta = {delta:?}");
+    }
+
+    // ── Named streams ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stream_write_never_touches_the_main_file() {
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        backend
+            .open(&p("new.txt"), opts_create())
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        {
+            let h = backend.open(&p("new.txt"), opts_open_rw()).await.unwrap();
+            h.write(0, b"fresh").await.unwrap();
+            h.close().await.unwrap();
+        }
+
+        let sh = backend
+            .open(&p("new.txt:AFP_AfpInfo"), opts_create())
+            .await
+            .expect("stream create must succeed once the host file exists");
+        sh.write(0, b"finder info blob").await.unwrap();
+        sh.close().await.unwrap();
+
+        let h = backend.open(&p("new.txt"), opts_open_ro()).await.unwrap();
+        let bytes = h.read(0, 1024).await.unwrap();
+        assert_eq!(
+            &bytes[..],
+            b"fresh",
+            "a stream write must never mutate the primary data stream"
+        );
+        h.close().await.unwrap();
+
+        // Real on-disk content lands under the sidecar directory, not
+        // beside the file under its own name.
+        assert_eq!(
+            std::fs::read(td.path().join(".smb-streams/new.txt/AFP_AfpInfo")).unwrap(),
+            b"finder info blob"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_open_on_missing_host_file_is_not_found() {
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        let err = match backend
+            .open(&p("ghost.txt:AFP_AfpInfo"), opts_create())
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(matches!(err, SmbError::NotFound), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn stream_selector_paired_with_directory_flag_is_rejected_by_the_backend() {
+        // The dispatcher rejects this combination before ever reaching a
+        // backend (create.rs Stage 1); the backend also refuses it
+        // defensively via `SmbPath` — the type marker restriction means a
+        // stream selector can only ever resolve to `$DATA`, which is never
+        // a directory stream.
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        let mut opts = opts_create();
+        opts.directory = true;
+        let err = match backend.open(&p("new.txt:AFP_AfpInfo"), opts).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(matches!(err, SmbError::NameInvalid), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn streams_dir_is_hidden_from_directory_listing() {
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        backend
+            .open(&p("new.txt"), opts_create())
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+        backend
+            .open(&p("new.txt:AFP_AfpInfo"), opts_create())
+            .await
+            .unwrap()
+            .write(0, b"x")
+            .await
+            .unwrap();
+
+        let dir_h = backend
+            .open(&SmbPath::root(), opts_open_dir())
+            .await
+            .unwrap();
+        let entries = dir_h.list_dir(None).await.unwrap();
+        assert!(entries.iter().any(|e| e.info.name == "new.txt"));
+        assert!(
+            !entries.iter().any(|e| e.info.name == ".smb-streams"),
+            "the stream sidecar directory must never appear in a listing"
+        );
+        dir_h.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_cannot_address_the_streams_control_path_directly() {
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        let err = match backend
+            .open(&p(".smb-streams\\new.txt\\AFP_AfpInfo"), opts_open_ro())
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(matches!(err, SmbError::AccessDenied), "got {err:?}");
     }
 }

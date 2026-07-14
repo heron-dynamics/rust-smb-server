@@ -23,6 +23,10 @@ struct MemInner {
     /// All directories present (always includes "" for the root). Each
     /// directory is keyed by canonical path string.
     dirs: HashMap<String, ()>,
+    /// Named-stream content, keyed by (host file's canonical path, stream
+    /// name) — stored independently of `files` so a stream write can never
+    /// touch the primary data stream.
+    streams: HashMap<(String, String), Vec<u8>>,
 }
 
 impl Default for MemFsBackend {
@@ -70,6 +74,51 @@ impl ShareBackend for MemFsBackend {
         let mut g = self.inner.lock().unwrap();
         let exists_file = g.files.contains_key(&k);
         let exists_dir = g.dirs.contains_key(&k);
+
+        if let Some(stream) = path.stream_name() {
+            // The stream selector (`file.txt:AFP_AfpInfo`) always resolves
+            // to `$DATA` type at this point — `SmbPath` rejects any other
+            // type — so it can only ever address a file's stream, never a
+            // directory's.
+            if exists_dir {
+                return Err(SmbError::IsDirectory);
+            }
+            if !exists_file {
+                return Err(SmbError::NotFound);
+            }
+            let sk = (k.clone(), stream.to_string());
+            let exists_stream = g.streams.contains_key(&sk);
+            match opts.intent {
+                OpenIntent::Open => {
+                    if !exists_stream {
+                        return Err(SmbError::NotFound);
+                    }
+                }
+                OpenIntent::Create => {
+                    if exists_stream {
+                        return Err(SmbError::Exists);
+                    }
+                    g.streams.insert(sk.clone(), Vec::new());
+                }
+                OpenIntent::OpenOrCreate => {
+                    g.streams.entry(sk.clone()).or_default();
+                }
+                OpenIntent::Truncate => {
+                    if !exists_stream {
+                        return Err(SmbError::NotFound);
+                    }
+                    g.streams.insert(sk.clone(), Vec::new());
+                }
+                OpenIntent::OverwriteOrCreate => {
+                    g.streams.insert(sk.clone(), Vec::new());
+                }
+            }
+            return Ok(Box::new(MemHandle::stream(
+                self.inner.clone(),
+                k,
+                stream.to_string(),
+            )));
+        }
 
         if opts.directory {
             if exists_file {
@@ -120,6 +169,7 @@ impl ShareBackend for MemFsBackend {
         let k = key(path);
         let mut g = self.inner.lock().unwrap();
         if g.files.remove(&k).is_some() {
+            g.streams.retain(|(fk, _), _| fk != &k);
             return Ok(());
         }
         if g.dirs.remove(&k).is_some() {
@@ -175,7 +225,18 @@ impl ShareBackend for MemFsBackend {
         }
 
         if let Some(data) = g.files.remove(&kf) {
-            g.files.insert(kt, data);
+            g.files.insert(kt.clone(), data);
+            let stream_keys: Vec<String> = g
+                .streams
+                .keys()
+                .filter(|(fk, _)| fk == &kf)
+                .map(|(_, sn)| sn.clone())
+                .collect();
+            for sn in stream_keys {
+                if let Some(data) = g.streams.remove(&(kf.clone(), sn.clone())) {
+                    g.streams.insert((kt.clone(), sn), data);
+                }
+            }
             return Ok(());
         }
         if g.dirs.remove(&kf).is_some() {
@@ -189,6 +250,7 @@ impl ShareBackend for MemFsBackend {
         BackendCapabilities {
             is_read_only: false,
             case_sensitive: false,
+            supports_named_streams: true,
         }
     }
 }
@@ -197,6 +259,9 @@ pub struct MemHandle {
     inner: std::sync::Arc<Mutex<MemInner>>,
     key: String,
     is_dir: bool,
+    /// Set for a named-stream handle — reads/writes/truncate then address
+    /// `MemInner::streams` under `(key, stream)` instead of `files[key]`.
+    stream: Option<String>,
 }
 
 impl MemHandle {
@@ -205,6 +270,7 @@ impl MemHandle {
             inner,
             key,
             is_dir: false,
+            stream: None,
         }
     }
 
@@ -213,6 +279,16 @@ impl MemHandle {
             inner,
             key,
             is_dir: true,
+            stream: None,
+        }
+    }
+
+    fn stream(inner: std::sync::Arc<Mutex<MemInner>>, key: String, stream: String) -> Self {
+        Self {
+            inner,
+            key,
+            is_dir: false,
+            stream: Some(stream),
         }
     }
 }
@@ -224,7 +300,13 @@ impl Handle for MemHandle {
             return Err(SmbError::IsDirectory);
         }
         let g = self.inner.lock().unwrap();
-        let data = g.files.get(&self.key).ok_or(SmbError::NotFound)?;
+        let data = match &self.stream {
+            Some(s) => g
+                .streams
+                .get(&(self.key.clone(), s.clone()))
+                .ok_or(SmbError::NotFound)?,
+            None => g.files.get(&self.key).ok_or(SmbError::NotFound)?,
+        };
         let start = offset as usize;
         if start >= data.len() {
             return Ok(Bytes::new());
@@ -238,7 +320,13 @@ impl Handle for MemHandle {
             return Err(SmbError::IsDirectory);
         }
         let mut g = self.inner.lock().unwrap();
-        let buf = g.files.get_mut(&self.key).ok_or(SmbError::NotFound)?;
+        let buf = match &self.stream {
+            Some(s) => g
+                .streams
+                .get_mut(&(self.key.clone(), s.clone()))
+                .ok_or(SmbError::NotFound)?,
+            None => g.files.get_mut(&self.key).ok_or(SmbError::NotFound)?,
+        };
         let needed = (offset as usize) + data.len();
         if buf.len() < needed {
             buf.resize(needed, 0);
@@ -256,7 +344,14 @@ impl Handle for MemHandle {
         let size = if self.is_dir {
             0
         } else {
-            g.files.get(&self.key).ok_or(SmbError::NotFound)?.len() as u64
+            match &self.stream {
+                Some(s) => g
+                    .streams
+                    .get(&(self.key.clone(), s.clone()))
+                    .ok_or(SmbError::NotFound)?
+                    .len() as u64,
+                None => g.files.get(&self.key).ok_or(SmbError::NotFound)?.len() as u64,
+            }
         };
         let name = self
             .key
@@ -285,7 +380,13 @@ impl Handle for MemHandle {
             return Err(SmbError::IsDirectory);
         }
         let mut g = self.inner.lock().unwrap();
-        let buf = g.files.get_mut(&self.key).ok_or(SmbError::NotFound)?;
+        let buf = match &self.stream {
+            Some(s) => g
+                .streams
+                .get_mut(&(self.key.clone(), s.clone()))
+                .ok_or(SmbError::NotFound)?,
+            None => g.files.get_mut(&self.key).ok_or(SmbError::NotFound)?,
+        };
         buf.resize(len as usize, 0);
         Ok(())
     }
@@ -521,5 +622,160 @@ mod tests {
         let inner = fs.inner.lock().unwrap();
         assert!(!inner.dirs.contains_key("src_dir"));
         assert!(inner.dirs.contains_key("dst_dir"));
+    }
+
+    // ── Named streams ───────────────────────────────────────────────────
+
+    fn opts_create() -> OpenOptions {
+        OpenOptions {
+            read: true,
+            write: true,
+            intent: OpenIntent::Create,
+            directory: false,
+            non_directory: false,
+            delete_on_close: false,
+        }
+    }
+
+    fn opts_open_or_create() -> OpenOptions {
+        OpenOptions {
+            read: true,
+            write: true,
+            intent: OpenIntent::OpenOrCreate,
+            directory: false,
+            non_directory: false,
+            delete_on_close: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_write_never_touches_the_main_file() {
+        let fs = MemFsBackend::new().with_file("new.txt", b"fresh");
+
+        let h = fs
+            .open(&p("new.txt:AFP_AfpInfo"), opts_create())
+            .await
+            .expect("stream create must succeed once the host file exists");
+        h.write(0, b"finder info blob").await.unwrap();
+        h.close().await.unwrap();
+
+        assert_eq!(
+            fs.inner.lock().unwrap().files.get("new.txt"),
+            Some(&b"fresh".to_vec()),
+            "a stream write must never mutate the primary data stream"
+        );
+        assert_eq!(
+            fs.inner
+                .lock()
+                .unwrap()
+                .streams
+                .get(&("new.txt".to_string(), "AFP_AfpInfo".to_string())),
+            Some(&b"finder info blob".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_open_on_missing_host_file_is_not_found() {
+        let fs = MemFsBackend::new();
+        let err = match fs.open(&p("ghost.txt:AFP_AfpInfo"), opts_create()).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(matches!(err, SmbError::NotFound), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn stream_open_on_a_directory_is_is_directory() {
+        let fs = MemFsBackend::new();
+        {
+            let mut inner = fs.inner.lock().unwrap();
+            inner.dirs.insert("adir".to_string(), ());
+        }
+        let err = match fs.open(&p("adir:AFP_AfpInfo"), opts_create()).await {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(matches!(err, SmbError::IsDirectory), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn distinct_stream_names_on_the_same_file_do_not_collide() {
+        let fs = MemFsBackend::new().with_file("new.txt", b"fresh");
+
+        let a = fs
+            .open(&p("new.txt:AFP_AfpInfo"), opts_open_or_create())
+            .await
+            .unwrap();
+        a.write(0, b"aaaa").await.unwrap();
+        a.close().await.unwrap();
+
+        let b = fs
+            .open(&p("new.txt:com.apple.ResourceFork"), opts_open_or_create())
+            .await
+            .unwrap();
+        b.write(0, b"bbbb").await.unwrap();
+        b.close().await.unwrap();
+
+        let inner = fs.inner.lock().unwrap();
+        assert_eq!(
+            inner
+                .streams
+                .get(&("new.txt".to_string(), "AFP_AfpInfo".to_string())),
+            Some(&b"aaaa".to_vec())
+        );
+        assert_eq!(
+            inner
+                .streams
+                .get(&("new.txt".to_string(), "com.apple.ResourceFork".to_string())),
+            Some(&b"bbbb".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn unlink_removes_the_file_and_its_streams() {
+        let fs = MemFsBackend::new().with_file("new.txt", b"fresh");
+        let h = fs
+            .open(&p("new.txt:AFP_AfpInfo"), opts_create())
+            .await
+            .unwrap();
+        h.write(0, b"x").await.unwrap();
+        h.close().await.unwrap();
+
+        fs.unlink(&p("new.txt")).await.unwrap();
+
+        let inner = fs.inner.lock().unwrap();
+        assert!(!inner.files.contains_key("new.txt"));
+        assert!(
+            !inner.streams.keys().any(|(fk, _)| fk == "new.txt"),
+            "streams must not outlive the file they're attached to"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_carries_streams_to_the_new_name() {
+        let fs = MemFsBackend::new().with_file("old.txt", b"fresh");
+        let h = fs
+            .open(&p("old.txt:AFP_AfpInfo"), opts_create())
+            .await
+            .unwrap();
+        h.write(0, b"meta").await.unwrap();
+        h.close().await.unwrap();
+
+        fs.rename(&p("old.txt"), &p("new.txt"), false)
+            .await
+            .unwrap();
+
+        let inner = fs.inner.lock().unwrap();
+        assert!(
+            !inner
+                .streams
+                .contains_key(&("old.txt".to_string(), "AFP_AfpInfo".to_string()))
+        );
+        assert_eq!(
+            inner
+                .streams
+                .get(&("new.txt".to_string(), "AFP_AfpInfo".to_string())),
+            Some(&b"meta".to_vec())
+        );
     }
 }

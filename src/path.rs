@@ -9,12 +9,20 @@ use std::str::FromStr;
 
 use crate::error::{SmbError, SmbResult};
 
-/// A validated, component-list path. No `..`, no Windows-forbidden chars, no
-/// alternate streams. Always relative to the share root — the empty path is
-/// the root.
+/// A validated, component-list path, plus an optional named-stream
+/// selector on the final component (MS-FSCC §2.1.5 "Alternate Data
+/// Streams"). No `..`, no Windows-forbidden chars outside the stream
+/// selector. Always relative to the share root — the empty path is the
+/// root.
+///
+/// `components` identifies the underlying file exactly as if the stream
+/// selector weren't present — routing, authorization, and directory
+/// containment all operate on the file identity, not the stream. Only
+/// `ShareBackend::open` needs to look at `stream`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SmbPath {
     components: Vec<String>,
+    stream: Option<String>,
 }
 
 impl SmbPath {
@@ -33,6 +41,15 @@ impl SmbPath {
         s.parse()
     }
 
+    /// Named stream on the final component, if any (e.g. `"AFP_AfpInfo"` for
+    /// `file.txt:AFP_AfpInfo`, or `file.txt:AFP_AfpInfo:$DATA`). `None` for
+    /// the file's own primary data stream — including the explicit
+    /// `file.txt::$DATA` form, which MS-SMB2 treats as equivalent to no
+    /// stream at all.
+    pub fn stream_name(&self) -> Option<&str> {
+        self.stream.as_deref()
+    }
+
     fn parse_components(s: &str) -> SmbResult<Self> {
         // Strip a leading separator (clients sometimes prefix `\` or `/`).
         let trimmed = s
@@ -43,22 +60,36 @@ impl SmbPath {
             return Ok(Self::root());
         }
 
-        // 2. Reject forbidden characters anywhere in the path.
+        // 2. Reject forbidden characters anywhere in the path. `:` is
+        //    handled separately below (allowed only in the final
+        //    component, as a stream selector).
         for ch in trimmed.chars() {
             if ch == '\0' || ('\u{0001}'..='\u{001F}').contains(&ch) {
                 return Err(SmbError::NameInvalid);
             }
-            // Allow `\` and `/` as separators, reject the rest of the
-            // Windows-forbidden set anywhere.
             match ch {
-                '<' | '>' | ':' | '"' | '|' | '?' | '*' => return Err(SmbError::NameInvalid),
+                '<' | '>' | '"' | '|' | '?' | '*' => return Err(SmbError::NameInvalid),
                 _ => {}
             }
         }
 
         // 3. Split on `\` or `/`; reject `..` and empty components; skip `.`.
         let mut components = Vec::new();
-        for raw in trimmed.split(['\\', '/']) {
+        let mut raw_parts: Vec<&str> = trimmed.split(['\\', '/']).collect();
+        let last = raw_parts.pop().ok_or(SmbError::NameInvalid)?;
+
+        // A `:` may only appear in the final path component (the stream
+        // selector). Any earlier component containing one names a stream on
+        // a directory, which v1 doesn't support.
+        for raw in &raw_parts {
+            if raw.contains(':') {
+                return Err(SmbError::NameInvalid);
+            }
+        }
+
+        let (last_name, stream) = split_stream_selector(last)?;
+
+        for raw in raw_parts {
             if raw.is_empty() {
                 // Doubled separator like `foo\\bar` — reject.
                 return Err(SmbError::NameInvalid);
@@ -75,7 +106,28 @@ impl SmbPath {
             }
             components.push(raw.to_string());
         }
-        Ok(Self { components })
+
+        if last_name.is_empty() {
+            // Doubled separator, or a bare `:stream` with no file name —
+            // both reject; a stream needs a named host file.
+            return Err(SmbError::NameInvalid);
+        }
+        if last_name == "." {
+            if stream.is_some() {
+                return Err(SmbError::NameInvalid);
+            }
+            // `.` alone (with no preceding components) is the root.
+        } else {
+            if last_name == ".." {
+                return Err(SmbError::NameInvalid);
+            }
+            if is_reserved_dos_name(last_name) {
+                return Err(SmbError::NameInvalid);
+            }
+            components.push(last_name.to_string());
+        }
+
+        Ok(Self { components, stream })
     }
 
     /// Path components in order. Empty for the root.
@@ -95,7 +147,10 @@ impl SmbPath {
         }
         let mut parent = self.components.clone();
         parent.pop();
-        Some(SmbPath { components: parent })
+        Some(SmbPath {
+            components: parent,
+            stream: None,
+        })
     }
 
     /// Return the last component, if any.
@@ -106,10 +161,11 @@ impl SmbPath {
     /// Append a single, already-validated last component to this path.
     pub fn join(&self, last: &str) -> SmbResult<SmbPath> {
         // Run `last` through the same validator (treating it as a single-
-        // component path).
+        // component path); its stream selector, if any, becomes this path's.
         let extra = last.parse::<SmbPath>()?;
         let mut out = self.clone();
         out.components.extend(extra.components);
+        out.stream = extra.stream;
         Ok(out)
     }
 
@@ -134,6 +190,32 @@ impl std::fmt::Display for SmbPath {
         } else {
             f.write_str(&self.display_backslash())
         }
+    }
+}
+
+/// Split a final path component into its file name and an optional stream
+/// selector (MS-FSCC §2.1.5): `name[:stream[:type]]`. `type`, if present,
+/// must be `$DATA` (case-insensitive) — v1 doesn't support other stream
+/// types (e.g. `$INDEX_ALLOCATION`). An empty stream name paired with an
+/// absent or `$DATA` type (`name::$DATA`, or a bare trailing `name:`) means
+/// "the primary data stream", i.e. no stream at all.
+fn split_stream_selector(last: &str) -> SmbResult<(&str, Option<String>)> {
+    let Some((name, rest)) = last.split_once(':') else {
+        return Ok((last, None));
+    };
+    let (stream, ty) = match rest.split_once(':') {
+        Some((stream, ty)) => (stream, Some(ty)),
+        None => (rest, None),
+    };
+    if let Some(ty) = ty
+        && !ty.eq_ignore_ascii_case("$DATA")
+    {
+        return Err(SmbError::NameInvalid);
+    }
+    if stream.is_empty() {
+        Ok((name, None))
+    } else {
+        Ok((name, Some(stream.to_string())))
     }
 }
 
@@ -235,9 +317,81 @@ mod tests {
 
     #[test]
     fn rejects_forbidden_chars() {
-        for bad in ["a<b", "a>b", "a:b", "a\"b", "a|b", "a?b", "a*b"] {
+        // `:` is deliberately absent here — it's the stream selector, see
+        // the `stream_selector_*` tests below.
+        for bad in ["a<b", "a>b", "a\"b", "a|b", "a?b", "a*b"] {
             assert!(bad.parse::<SmbPath>().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn stream_selector_parses_off_the_final_component() {
+        let p = "file.txt:AFP_AfpInfo".parse::<SmbPath>().unwrap();
+        assert_eq!(p.components(), &["file.txt"]);
+        assert_eq!(p.stream_name(), Some("AFP_AfpInfo"));
+    }
+
+    #[test]
+    fn stream_selector_works_under_a_directory() {
+        let p = "dir\\file.txt:com.apple.ResourceFork"
+            .parse::<SmbPath>()
+            .unwrap();
+        assert_eq!(p.components(), &["dir", "file.txt"]);
+        assert_eq!(p.stream_name(), Some("com.apple.ResourceFork"));
+    }
+
+    #[test]
+    fn stream_selector_accepts_explicit_data_type_suffix() {
+        let p = "file.txt:AFP_AfpInfo:$DATA".parse::<SmbPath>().unwrap();
+        assert_eq!(p.components(), &["file.txt"]);
+        assert_eq!(p.stream_name(), Some("AFP_AfpInfo"));
+    }
+
+    #[test]
+    fn stream_selector_type_suffix_is_case_insensitive() {
+        let p = "file.txt:AFP_AfpInfo:$data".parse::<SmbPath>().unwrap();
+        assert_eq!(p.stream_name(), Some("AFP_AfpInfo"));
+    }
+
+    #[test]
+    fn bare_data_type_suffix_means_no_stream() {
+        // `file.txt::$DATA` explicitly names the primary data stream —
+        // MS-SMB2 treats this as equivalent to no stream selector at all.
+        let p = "file.txt::$DATA".parse::<SmbPath>().unwrap();
+        assert_eq!(p.components(), &["file.txt"]);
+        assert_eq!(p.stream_name(), None);
+    }
+
+    #[test]
+    fn trailing_bare_colon_means_no_stream() {
+        let p = "file.txt:".parse::<SmbPath>().unwrap();
+        assert_eq!(p.components(), &["file.txt"]);
+        assert_eq!(p.stream_name(), None);
+    }
+
+    #[test]
+    fn rejects_unsupported_stream_type() {
+        assert!(
+            "file.txt:stream:$INDEX_ALLOCATION"
+                .parse::<SmbPath>()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_stream_selector_on_a_non_final_component() {
+        assert!("dir:stream\\file.txt".parse::<SmbPath>().is_err());
+    }
+
+    #[test]
+    fn rejects_bare_stream_with_no_file_name() {
+        assert!(":stream".parse::<SmbPath>().is_err());
+    }
+
+    #[test]
+    fn plain_paths_have_no_stream() {
+        assert_eq!("file.txt".parse::<SmbPath>().unwrap().stream_name(), None);
+        assert_eq!(SmbPath::root().stream_name(), None);
     }
 
     #[test]

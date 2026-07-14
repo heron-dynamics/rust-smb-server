@@ -130,6 +130,12 @@ pub async fn handle(
     if directory && matches!(intent, OpenIntent::OverwriteOrCreate | OpenIntent::Truncate) {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     }
+    // A named stream selector never names a directory (v1 doesn't support
+    // `$INDEX_ALLOCATION`-type streams — `SmbPath` already rejects any type
+    // other than `$DATA`).
+    if directory && path.stream_name().is_some() {
+        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+    }
     let delete_on_close = req.create_options & FILE_DELETE_ON_CLOSE != 0;
 
     let opts = OpenOptions {
@@ -531,6 +537,45 @@ mod tests {
             ntstatus::STATUS_SUCCESS,
             "FILE_DIRECTORY_FILE + FILE_OPEN must survive Stage 1 and reach the backend"
         );
+    }
+
+    // -- Named streams (docs/SMB_DEFECTS.md S2/S10, Step 3) -----------------
+
+    #[tokio::test]
+    async fn stream_create_on_an_existing_file_reaches_the_backend() {
+        let server = test_server();
+        let (conn, session_id, tree_id) = test_conn_with_tree(MemFsBackend::new()).await;
+        let hdr = create_header(session_id, tree_id);
+
+        let host_body = create_request_bytes("new.txt", 0, FILE_CREATE);
+        let host_resp = handle(&server, &conn, &hdr, &host_body).await;
+        assert_eq!(
+            host_resp.status,
+            ntstatus::STATUS_SUCCESS,
+            "setup: create the host file"
+        );
+
+        let stream_body = create_request_bytes("new.txt:AFP_AfpInfo", 0, FILE_CREATE);
+        let stream_resp = handle(&server, &conn, &hdr, &stream_body).await;
+        assert_eq!(
+            stream_resp.status,
+            ntstatus::STATUS_SUCCESS,
+            "a stream CREATE against an existing host file must reach the backend and succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_create_paired_with_directory_flag_is_invalid_parameter() {
+        let server = test_server();
+        let (conn, session_id, tree_id) = test_conn_with_tree(MemFsBackend::new()).await;
+        let hdr = create_header(session_id, tree_id);
+
+        let host_body = create_request_bytes("new.txt", 0, FILE_CREATE);
+        handle(&server, &conn, &hdr, &host_body).await;
+
+        let body = create_request_bytes("new.txt:AFP_AfpInfo", FILE_DIRECTORY_FILE, FILE_CREATE);
+        let resp = handle(&server, &conn, &hdr, &body).await;
+        assert_eq!(resp.status, ntstatus::STATUS_INVALID_PARAMETER);
     }
 
     // -- AAPL create context (docs/SMB_DEFECTS.md S2/S10, Step 2) ----------
