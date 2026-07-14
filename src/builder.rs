@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::backend::ShareBackend;
 use crate::server::{ServerConfig, ServerState, ServerUsers, ShareBindings, ShareMode, SmbServer};
+use crate::trace::TraceSink;
 
 // ---------------------------------------------------------------------------
 // Access
@@ -117,6 +118,7 @@ pub struct SmbServerBuilder {
     max_read_size: u32,
     max_write_size: u32,
     server_guid: Option<Uuid>,
+    trace_sink: Option<Arc<dyn TraceSink>>,
 }
 
 impl Default for SmbServerBuilder {
@@ -136,6 +138,7 @@ impl SmbServerBuilder {
             max_read_size: 1024 * 1024,
             max_write_size: 1024 * 1024,
             server_guid: None,
+            trace_sink: None,
         }
     }
 
@@ -176,6 +179,14 @@ impl SmbServerBuilder {
     /// Override the random per-process server GUID. Mostly useful in tests.
     pub fn server_guid(mut self, guid: Uuid) -> Self {
         self.server_guid = Some(guid);
+        self
+    }
+
+    /// Arms the request trace (`docs/PLAN_smb_round_two.md` Step 1a). Absent
+    /// (the default), every recording site is a null check and nothing is
+    /// allocated or formatted — this method is the only way to change that.
+    pub fn trace_sink(mut self, sink: Arc<dyn TraceSink>) -> Self {
+        self.trace_sink = Some(sink);
         self
     }
 
@@ -253,7 +264,8 @@ impl SmbServerBuilder {
             table: tokio::sync::RwLock::new(user_table),
         };
 
-        let state = ServerState::new(cfg, users, share_bindings);
+        let mut state = ServerState::new(cfg, users, share_bindings);
+        state.trace_sink = self.trace_sink;
         Ok(SmbServer::from_state(state))
     }
 }

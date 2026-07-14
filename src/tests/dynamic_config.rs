@@ -31,12 +31,14 @@ async fn register_session(
     share_name: &str,
 ) -> Arc<Connection> {
     let state = server.state();
+    let conn_id = state.active_connections.alloc_id();
     let conn = Arc::new(Connection::new(
+        conn_id,
         state.config.server_guid,
         state.config.max_read_size,
         state.config.max_write_size,
     ));
-    state.active_connections.register(&conn).await;
+    state.active_connections.insert(conn_id, &conn).await;
 
     let session = Session::new(1, identity, [0; 16], [0; 16], false, None);
     let session = Arc::new(tokio::sync::RwLock::new(session));

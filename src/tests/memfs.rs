@@ -118,11 +118,11 @@ impl ShareBackend for MemFsBackend {
         Err(SmbError::NotFound)
     }
 
-    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()> {
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace: bool) -> SmbResult<()> {
         let kf = key(from);
         let kt = key(to);
         let mut g = self.inner.lock().unwrap();
-        if g.files.contains_key(&kt) || g.dirs.contains_key(&kt) {
+        if !replace && (g.files.contains_key(&kt) || g.dirs.contains_key(&kt)) {
             return Err(SmbError::Exists);
         }
         if let Some(data) = g.files.remove(&kf) {

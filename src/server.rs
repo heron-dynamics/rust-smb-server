@@ -154,9 +154,22 @@ impl ActiveConnections {
         }
     }
 
-    pub async fn register(&self, conn: &Arc<Connection>) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+    /// Mints a fresh, per-accepted-socket connection id. Split from
+    /// `insert` so a caller can stamp the id onto `Connection` itself
+    /// (`Connection::connection_id` — the trace key's `connection_id`
+    /// component, `docs/PLAN_smb_round_two.md` Step 1a) before the
+    /// `Connection` is wrapped in the `Arc` this table stores.
+    pub fn alloc_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub async fn insert(&self, id: u64, conn: &Arc<Connection>) {
         self.conns.write().await.insert(id, Arc::downgrade(conn));
+    }
+
+    pub async fn register(&self, conn: &Arc<Connection>) -> u64 {
+        let id = self.alloc_id();
+        self.insert(id, conn).await;
         id
     }
 
@@ -196,6 +209,9 @@ pub struct ServerState {
     /// iteration and connection loops abandon their next read.
     pub shutdown: Arc<Notify>,
     pub shutting_down: Arc<AtomicBool>,
+    /// `None` unless `SmbServer::builder().trace_sink(...)` was called
+    /// (`docs/PLAN_smb_round_two.md` Step 1a).
+    pub trace_sink: crate::trace::SinkHandle,
 }
 
 impl ServerState {
@@ -208,6 +224,7 @@ impl ServerState {
             server_start_filetime: now_filetime(),
             shutdown: Arc::new(Notify::new()),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            trace_sink: None,
         }
     }
 

@@ -92,6 +92,7 @@ pub async fn dispatch_frame(
     let mut prev_session_id = 0;
     let mut prev_tree_id = 0;
     let mut prev_create_file_id = None;
+    let mut compound_ordinal: u16 = 0;
 
     while sub_offset < frame.len() {
         let available = &frame[sub_offset..];
@@ -136,12 +137,13 @@ pub async fn dispatch_frame(
         prev_session_id = req_hdr.session_id;
         prev_tree_id = req_hdr.tree_id().unwrap_or(0);
 
-        if let Some(response) = dispatch_one(server, conn, &sub_frame).await {
+        if let Some(response) = dispatch_one(server, conn, &sub_frame, compound_ordinal).await {
             if req_hdr.command == Command::Create {
                 prev_create_file_id = capture_create_file_id(&response);
             }
             responses.push(response);
         }
+        compound_ordinal = compound_ordinal.saturating_add(1);
 
         if next == 0 {
             break;
@@ -291,6 +293,7 @@ async fn dispatch_one(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     frame: &[u8],
+    compound_ordinal: u16,
 ) -> Option<Vec<u8>> {
     let (req_hdr, body_bytes) = match Smb2Header::parse(frame) {
         Ok(p) => p,
@@ -305,13 +308,34 @@ async fn dispatch_one(
     let sid = req_hdr.session_id;
     let tid = req_hdr.tree_id().unwrap_or(0);
 
+    let trace_key = server.trace_sink.as_ref().map(|_| crate::trace::TraceKey {
+        connection_id: conn.connection_id,
+        message_id: mid,
+        compound_ordinal,
+    });
+    crate::trace::record(
+        &server.trace_sink,
+        trace_key,
+        crate::trace::TraceEvent::Request {
+            cmd: command_name(cmd),
+            session_id: sid,
+            tree_id: tid,
+        },
+    );
+
     let span = debug_span!("dispatch", cmd = ?cmd, mid, sid, tid);
-    async move {
+    crate::trace::scoped(trace_key, async move {
         debug!("dispatch start");
 
         // Verify signature on incoming request (when applicable).
         if let Err(status) = verify_request_signature(server, conn, &req_hdr, frame).await {
-            return Some(build_response_bytes(conn, &req_hdr, HandlerResponse::err(status)).await);
+            let bytes = build_response_bytes(conn, &req_hdr, HandlerResponse::err(status)).await;
+            crate::trace::record(
+                &server.trace_sink,
+                trace_key,
+                crate::trace::TraceEvent::Response { status },
+            );
+            return Some(bytes);
         }
 
         // CANCEL is fire-and-forget — no response.
@@ -362,6 +386,13 @@ async fn dispatch_one(
         }
 
         let bytes = build_response_bytes(conn, &req_hdr, resp).await;
+        crate::trace::record(
+            &server.trace_sink,
+            trace_key,
+            crate::trace::TraceEvent::Response {
+                status: read_u32(&bytes, 0x08),
+            },
+        );
 
         if cmd == Command::Negotiate {
             let mut p = conn
@@ -387,9 +418,35 @@ async fn dispatch_one(
         }
 
         Some(bytes)
-    }
+    })
     .instrument(span)
     .await
+}
+
+/// Stable, `'static` command name for `TraceEvent::Request` — never the
+/// request/response body, never file content.
+fn command_name(cmd: Command) -> &'static str {
+    match cmd {
+        Command::Negotiate => "Negotiate",
+        Command::SessionSetup => "SessionSetup",
+        Command::Logoff => "Logoff",
+        Command::TreeConnect => "TreeConnect",
+        Command::TreeDisconnect => "TreeDisconnect",
+        Command::Create => "Create",
+        Command::Close => "Close",
+        Command::Flush => "Flush",
+        Command::Read => "Read",
+        Command::Write => "Write",
+        Command::Lock => "Lock",
+        Command::Ioctl => "Ioctl",
+        Command::Cancel => "Cancel",
+        Command::Echo => "Echo",
+        Command::QueryDirectory => "QueryDirectory",
+        Command::ChangeNotify => "ChangeNotify",
+        Command::QueryInfo => "QueryInfo",
+        Command::SetInfo => "SetInfo",
+        Command::OplockBreak => "OplockBreak",
+    }
 }
 
 async fn take_session_preauth(conn: &Arc<Connection>, session_id: u64) -> PreauthIntegrity {
@@ -603,7 +660,7 @@ mod tests {
     use uuid::Uuid;
 
     fn test_conn() -> Arc<Connection> {
-        Arc::new(Connection::new(Uuid::nil(), 1024 * 1024, 1024 * 1024))
+        Arc::new(Connection::new(1, Uuid::nil(), 1024 * 1024, 1024 * 1024))
     }
 
     fn negotiated_preauth() -> PreauthIntegrity {

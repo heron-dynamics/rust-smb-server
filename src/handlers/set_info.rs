@@ -16,7 +16,7 @@ use crate::server::ServerState;
 use crate::utils::utf16le_to_units;
 
 pub async fn handle(
-    _server: &Arc<ServerState>,
+    server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
     body: &[u8],
@@ -48,6 +48,14 @@ pub async fn handle(
         let tree = tree_arc.read().await;
         tree.share.backend.clone()
     };
+
+    if class != ic::FILE_RENAME_INFORMATION && server.trace_sink.is_some() {
+        crate::trace::record(
+            &server.trace_sink,
+            crate::trace::current_trace_key(),
+            crate::trace::TraceEvent::SetInfoOther { info_class: class },
+        );
+    }
 
     let result = match class {
         ic::FILE_BASIC_INFORMATION => {
@@ -117,7 +125,20 @@ pub async fn handle(
                 Err(_) => return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID),
             };
             let from = open_arc.read().await.last_path.clone();
-            match backend.rename(&from, &new_path).await {
+            // MS-FSCC §2.4.37 byte 0.
+            let replace_if_exists = buffer[0] != 0;
+            if server.trace_sink.is_some() {
+                crate::trace::record(
+                    &server.trace_sink,
+                    crate::trace::current_trace_key(),
+                    crate::trace::TraceEvent::SetInfoRename {
+                        replace_if_exists,
+                        new_name: new_path.display_backslash(),
+                        resolved_source: from.display_backslash(),
+                    },
+                );
+            }
+            match backend.rename(&from, &new_path, replace_if_exists).await {
                 Ok(()) => {
                     open_arc.write().await.last_path = new_path;
                     Ok(())

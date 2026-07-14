@@ -165,8 +165,12 @@ pub trait ShareBackend: Send + Sync + 'static {
     /// recursively delete.
     async fn unlink(&self, path: &SmbPath) -> SmbResult<()>;
 
-    /// Rename `from` to `to`. The backend must reject if `to` already exists.
-    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()>;
+    /// Rename `from` to `to`. `replace` is MS-FSCC §2.4.37's
+    /// `ReplaceIfExists`: `false` — the backend MUST reject if `to` already
+    /// exists; `true` — the backend MUST replace `to` atomically if it
+    /// exists (Unix `rename(2)` semantics: refuses a non-empty directory
+    /// target, a directory-over-file or file-over-directory kind mismatch).
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace: bool) -> SmbResult<()>;
 
     /// Static capabilities. The dispatcher consults these at TREE_CONNECT and
     /// uses `is_read_only` to clamp authz.
@@ -226,7 +230,7 @@ impl ShareBackend for NotSupportedBackend {
     async fn unlink(&self, _path: &SmbPath) -> SmbResult<()> {
         Err(SmbError::NotSupported)
     }
-    async fn rename(&self, _from: &SmbPath, _to: &SmbPath) -> SmbResult<()> {
+    async fn rename(&self, _from: &SmbPath, _to: &SmbPath, _replace: bool) -> SmbResult<()> {
         Err(SmbError::NotSupported)
     }
     fn capabilities(&self) -> BackendCapabilities {

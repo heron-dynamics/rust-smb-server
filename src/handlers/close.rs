@@ -15,7 +15,7 @@ use crate::server::ServerState;
 const FLAG_POSTQUERY_ATTRIB: u16 = 0x0001;
 
 pub async fn handle(
-    _server: &Arc<ServerState>,
+    server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
     body: &[u8],
@@ -45,6 +45,24 @@ pub async fn handle(
     let delete_on_close = open.delete_on_close;
     let want_attrs = req.flags & FLAG_POSTQUERY_ATTRIB != 0;
     drop(open);
+
+    if server.trace_sink.is_some() {
+        crate::trace::record(
+            &server.trace_sink,
+            crate::trace::current_trace_key(),
+            crate::trace::TraceEvent::Close {
+                file_id: [
+                    req.file_id.persistent.to_le_bytes(),
+                    req.file_id.volatile.to_le_bytes(),
+                ]
+                .concat()
+                .try_into()
+                .expect("FileId is 16 bytes"),
+                delete_on_close,
+                last_path: path.display_backslash(),
+            },
+        );
+    }
 
     // Stat before closing if needed.
     let info_before_close = if want_attrs {

@@ -46,7 +46,7 @@ const FILE_OPENED: u32 = 0x0000_0001;
 const FILE_CREATED: u32 = 0x0000_0002;
 
 pub async fn handle(
-    _server: &Arc<ServerState>,
+    server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
     body: &[u8],
@@ -122,6 +122,14 @@ pub async fn handle(
     if directory && non_directory {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
     }
+    // MS-SMB2 §2.2.13: FILE_DIRECTORY_FILE is valid only paired with
+    // FILE_CREATE, FILE_OPEN_IF, or FILE_OPEN — never with a disposition
+    // that overwrites or truncates. Validated here, in the fork's own
+    // handler, before any backend is called; `smb.rs`'s adapter does not
+    // duplicate this check (`docs/PLAN_smb_round_two.md` Step 2, Stage 1).
+    if directory && matches!(intent, OpenIntent::OverwriteOrCreate | OpenIntent::Truncate) {
+        return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);
+    }
     let delete_on_close = req.create_options & FILE_DELETE_ON_CLOSE != 0;
 
     let opts = OpenOptions {
@@ -153,6 +161,7 @@ pub async fn handle(
     // Allocate FileId, register Open.
     let tree = tree_arc.write().await;
     let file_id = tree.alloc_file_id();
+    let path_for_trace = path.display_backslash();
     let open = Open::new(
         file_id,
         handle,
@@ -164,6 +173,39 @@ pub async fn handle(
     let open_arc = Arc::new(tokio::sync::RwLock::new(open));
     tree.opens.write().await.insert(file_id, open_arc);
     drop(tree);
+
+    if server.trace_sink.is_some() {
+        let contexts = crate::proto::messages::CreateContext::parse_chain(&req.create_contexts)
+            .map(|chain| {
+                chain
+                    .into_iter()
+                    .map(|c| crate::trace::CreateContextInfo {
+                        name: c.name,
+                        data_len: c.data.len() as u32,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        crate::trace::record(
+            &server.trace_sink,
+            crate::trace::current_trace_key(),
+            crate::trace::TraceEvent::Create {
+                path: path_for_trace,
+                directory,
+                non_directory,
+                create_disposition: req.create_disposition,
+                desired_access: req.desired_access,
+                file_id: [
+                    file_id.persistent.to_le_bytes(),
+                    file_id.volatile.to_le_bytes(),
+                ]
+                .concat()
+                .try_into()
+                .expect("FileId is 16 bytes"),
+                contexts,
+            },
+        );
+    }
 
     let create_action = match intent {
         OpenIntent::Create => FILE_CREATED,

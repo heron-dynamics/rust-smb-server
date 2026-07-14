@@ -394,7 +394,7 @@ impl ShareBackend for LocalFsBackend {
         .map_err(io_to_smb)
     }
 
-    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()> {
+    async fn rename(&self, from: &SmbPath, to: &SmbPath, replace: bool) -> SmbResult<()> {
         if self.read_only {
             return Err(SmbError::AccessDenied);
         }
@@ -407,11 +407,16 @@ impl ShareBackend for LocalFsBackend {
         let root2 = Arc::clone(&self.root);
 
         spawn_blocking(move || -> io::Result<()> {
-            // Reject overwrite — SMB rename semantics require explicit
-            // replace-if-exists which we do not implement in v1.
-            if root2.exists(&to_path) {
+            // `replace == false`: reject overwrite explicitly — Unix
+            // `rename(2)` would otherwise replace silently, and
+            // `ReplaceIfExists == 0` MUST NOT.
+            if !replace && root2.exists(&to_path) {
                 return Err(io::Error::from(io::ErrorKind::AlreadyExists));
             }
+            // `replace == true`: a single `rename(2)` call, atomic-over-
+            // existing on Unix. Kind-mismatch and non-empty-directory
+            // targets are refused by the OS itself (EISDIR/ENOTDIR/ENOTEMPTY),
+            // mapped by `io_to_smb` below.
             root.rename(&from, &root2, &to_path)
         })
         .await
@@ -841,19 +846,138 @@ mod tests {
         h.write(0, b"data").await.unwrap();
         h.close().await.unwrap();
 
-        backend.rename(&p("old.txt"), &p("new.txt")).await.unwrap();
+        backend
+            .rename(&p("old.txt"), &p("new.txt"), false)
+            .await
+            .unwrap();
         assert!(td.path().join("new.txt").exists());
         assert!(!td.path().join("old.txt").exists());
 
-        // Renaming over an existing target should fail.
+        // Renaming over an existing target with replace=false must fail.
         let h = backend.open(&p("other.txt"), opts_create()).await.unwrap();
         h.close().await.unwrap();
         let err = backend
-            .rename(&p("other.txt"), &p("new.txt"))
+            .rename(&p("other.txt"), &p("new.txt"), false)
             .await
             .err()
             .unwrap();
         assert!(matches!(err, SmbError::Exists), "got {err:?}");
+    }
+
+    // ── Step 3 (`docs/PLAN_smb_round_two.md`) — `ReplaceIfExists` matrix ───
+
+    #[tokio::test]
+    async fn replace_true_replaces_existing_file_atomically() {
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+
+        let h = backend.open(&p("src.txt"), opts_create()).await.unwrap();
+        h.write(0, b"new bytes").await.unwrap();
+        h.close().await.unwrap();
+        let h = backend.open(&p("dst.txt"), opts_create()).await.unwrap();
+        h.write(0, b"old bytes").await.unwrap();
+        h.close().await.unwrap();
+
+        backend
+            .rename(&p("src.txt"), &p("dst.txt"), true)
+            .await
+            .unwrap();
+        assert!(!td.path().join("src.txt").exists());
+        assert_eq!(
+            std::fs::read(td.path().join("dst.txt")).unwrap(),
+            b"new bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_either_way_creates_a_missing_target() {
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+
+        let h = backend.open(&p("src.txt"), opts_create()).await.unwrap();
+        h.close().await.unwrap();
+        backend
+            .rename(&p("src.txt"), &p("dst.txt"), true)
+            .await
+            .unwrap();
+        assert!(td.path().join("dst.txt").exists());
+
+        let h = backend.open(&p("src2.txt"), opts_create()).await.unwrap();
+        h.close().await.unwrap();
+        backend
+            .rename(&p("src2.txt"), &p("dst2.txt"), false)
+            .await
+            .unwrap();
+        assert!(td.path().join("dst2.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn replace_true_replaces_an_existing_empty_directory() {
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        std::fs::create_dir(td.path().join("src_dir")).unwrap();
+        std::fs::create_dir(td.path().join("dst_dir")).unwrap();
+
+        backend
+            .rename(&p("src_dir"), &p("dst_dir"), true)
+            .await
+            .unwrap();
+        assert!(!td.path().join("src_dir").exists());
+        assert!(td.path().join("dst_dir").is_dir());
+    }
+
+    #[tokio::test]
+    async fn replace_true_rejects_a_non_empty_directory_target() {
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        std::fs::create_dir(td.path().join("src_dir")).unwrap();
+        std::fs::create_dir(td.path().join("dst_dir")).unwrap();
+        std::fs::write(td.path().join("dst_dir").join("inside"), b"x").unwrap();
+
+        let err = backend
+            .rename(&p("src_dir"), &p("dst_dir"), true)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, SmbError::NotEmpty), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn replace_true_rejects_directory_over_file_kind_mismatch() {
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        std::fs::create_dir(td.path().join("src_dir")).unwrap();
+        let h = backend
+            .open(&p("dst_file.txt"), opts_create())
+            .await
+            .unwrap();
+        h.close().await.unwrap();
+
+        let err = backend
+            .rename(&p("src_dir"), &p("dst_file.txt"), true)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, SmbError::NotADirectory), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn replace_true_rejects_file_over_directory_kind_mismatch() {
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+        let h = backend
+            .open(&p("src_file.txt"), opts_create())
+            .await
+            .unwrap();
+        h.close().await.unwrap();
+        std::fs::create_dir(td.path().join("dst_dir")).unwrap();
+
+        let err = backend
+            .rename(&p("src_file.txt"), &p("dst_dir"), true)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, SmbError::IsDirectory), "got {err:?}");
     }
 
     #[tokio::test]

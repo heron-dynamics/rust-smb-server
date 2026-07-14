@@ -13,7 +13,7 @@ use crate::ntstatus;
 use crate::server::ServerState;
 
 pub async fn handle(
-    _server: &Arc<ServerState>,
+    server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     hdr: &Smb2Header,
     body: &[u8],
@@ -22,6 +22,23 @@ pub async fn handle(
         Ok(r) => r,
         Err(_) => return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER),
     };
+    if server.trace_sink.is_some() {
+        crate::trace::record(
+            &server.trace_sink,
+            crate::trace::current_trace_key(),
+            crate::trace::TraceEvent::Write {
+                file_id: [
+                    req.file_id.persistent.to_le_bytes(),
+                    req.file_id.volatile.to_le_bytes(),
+                ]
+                .concat()
+                .try_into()
+                .expect("FileId is 16 bytes"),
+                offset: req.offset,
+                length: req.length,
+            },
+        );
+    }
     let max_write = *conn.max_write_size.read().await;
     if req.length > max_write {
         return HandlerResponse::err(ntstatus::STATUS_INVALID_PARAMETER);

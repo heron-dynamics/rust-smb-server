@@ -27,6 +27,11 @@ pub type PendingAuth = Arc<Mutex<(NtlmServer, bool)>>;
 
 /// One connection's negotiated state and its session/tree/open tables.
 pub struct Connection {
+    /// Per-accepted-socket counter (`ActiveConnections::alloc_id`) — the
+    /// `connection_id` component of a `TraceKey` (Step 1a). `message_id` is
+    /// only unique within one connection, so this is what makes the key
+    /// collision-free across concurrent connections.
+    pub connection_id: u64,
     pub server_guid: Uuid,
     pub client_guid: tokio::sync::RwLock<Uuid>,
     pub dialect: tokio::sync::RwLock<Option<Dialect>>,
@@ -57,8 +62,14 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn new(server_guid: Uuid, max_read_size: u32, max_write_size: u32) -> Self {
+    pub fn new(
+        connection_id: u64,
+        server_guid: Uuid,
+        max_read_size: u32,
+        max_write_size: u32,
+    ) -> Self {
         Self {
+            connection_id,
             server_guid,
             client_guid: tokio::sync::RwLock::new(Uuid::nil()),
             dialect: tokio::sync::RwLock::new(None),

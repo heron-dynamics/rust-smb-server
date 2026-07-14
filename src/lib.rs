@@ -29,6 +29,7 @@ pub mod ntstatus;
 mod path;
 mod proto;
 mod server;
+pub mod trace;
 mod utils;
 
 pub use backend::{
@@ -42,6 +43,7 @@ pub use fs::LocalFsBackend;
 pub use path::SmbPath;
 pub use proto::auth::ntlm::Identity;
 pub use server::{ConfigHandle, ShareMode, ShutdownHandle, SmbServer};
+pub use trace::{CreateContextInfo, TraceEvent, TraceKey, TraceSink, current_trace_key};
 
 pub mod wire {
     pub use crate::proto::header;

@@ -18,12 +18,14 @@ use state::Connection;
 /// either side hangs up. Returns once both halves are done.
 pub async fn connection_loop(stream: TcpStream, server: Arc<ServerState>) -> io::Result<()> {
     let (read_half, write_half) = tokio::io::split(stream);
+    let conn_id = server.active_connections.alloc_id();
     let conn = Arc::new(Connection::new(
+        conn_id,
         server.config.server_guid,
         server.config.max_read_size,
         server.config.max_write_size,
     ));
-    let conn_id = server.active_connections.register(&conn).await;
+    server.active_connections.insert(conn_id, &conn).await;
     let (tx, rx) = mpsc::channel::<writer::FramePayload>(writer::WRITER_CHANNEL);
 
     let writer_handle = tokio::spawn(writer::writer_task(write_half, rx));
