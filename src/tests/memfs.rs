@@ -148,6 +148,14 @@ impl ShareBackend for MemFsBackend {
             if !replace {
                 return Err(SmbError::Exists);
             }
+            if kf == kt {
+                // POSIX rename(2): identical source and destination is a
+                // successful no-op. Without this, the destination-removal
+                // below deletes the one entry that is both source and
+                // destination, and the re-insert further down never finds
+                // it under `kf` again.
+                return Ok(());
+            }
             // `replace == true`: mirror Unix `rename(2)` semantics — kind
             // mismatches and a non-empty directory target are rejected;
             // otherwise the destination entry is removed first so the
@@ -381,6 +389,44 @@ mod tests {
             Some(&b"untouched".to_vec()),
             "the destination must survive a rename whose source never existed"
         );
+    }
+
+    #[tokio::test]
+    async fn replace_true_self_rename_of_a_file_is_a_successful_no_op() {
+        let fs = MemFsBackend::new().with_file("same.txt", b"data");
+        fs.rename(&p("same.txt"), &p("same.txt"), true)
+            .await
+            .expect("identical source and destination must succeed as a no-op");
+        assert_eq!(
+            fs.inner.lock().unwrap().files.get("same.txt"),
+            Some(&b"data".to_vec()),
+            "content must be unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_true_self_rename_of_a_directory_is_a_successful_no_op() {
+        let fs = MemFsBackend::new();
+        {
+            let mut inner = fs.inner.lock().unwrap();
+            inner.dirs.insert("same_dir".to_string(), ());
+        }
+        fs.rename(&p("same_dir"), &p("same_dir"), true)
+            .await
+            .expect("identical source and destination must succeed as a no-op");
+        assert!(fs.inner.lock().unwrap().dirs.contains_key("same_dir"));
+    }
+
+    #[tokio::test]
+    async fn replace_false_self_rename_is_still_exists() {
+        // The trait contract's `replace=false` branch fires on "does `to`
+        // exist" — it must not special-case `from == to` as a no-op.
+        let fs = MemFsBackend::new().with_file("same.txt", b"data");
+        let err = fs
+            .rename(&p("same.txt"), &p("same.txt"), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SmbError::Exists), "got {err:?}");
     }
 
     #[tokio::test]
