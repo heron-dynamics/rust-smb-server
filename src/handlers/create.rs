@@ -383,10 +383,10 @@ mod tests {
         let (conn, session_id, tree_id) = test_conn_with_tree(MemFsBackend::new()).await;
         let hdr = create_header(session_id, tree_id);
 
-        // FILE_CREATE, FILE_OPEN_IF, FILE_OPEN are the only three
-        // dispositions Stage 1 permits paired with FILE_DIRECTORY_FILE —
-        // each must reach the backend (a fresh MemFsBackend has no
-        // "newdir", so both creating dispositions succeed by creating it).
+        // FILE_CREATE, FILE_OPEN_IF are two of the three dispositions
+        // Stage 1 permits paired with FILE_DIRECTORY_FILE — each must
+        // reach the backend (a fresh MemFsBackend has no "newdir", so both
+        // creating dispositions succeed by creating it).
         for (disposition, name) in [
             (FILE_CREATE, "newdir_create"),
             (FILE_OPEN_IF, "newdir_openif"),
@@ -399,5 +399,32 @@ mod tests {
                 "disposition {disposition:#x} must survive Stage 1 and reach the backend"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn directory_flag_with_open_disposition_survives_stage1() {
+        let server = test_server();
+        let (conn, session_id, tree_id) = test_conn_with_tree(MemFsBackend::new()).await;
+        let hdr = create_header(session_id, tree_id);
+
+        // FILE_OPEN is the third disposition Stage 1 permits paired with
+        // FILE_DIRECTORY_FILE — but FILE_OPEN requires the target to
+        // already exist, so create it first (via FILE_CREATE) and only
+        // then exercise FILE_OPEN against it.
+        let create_body = create_request_bytes("existing_dir", FILE_DIRECTORY_FILE, FILE_CREATE);
+        let create_resp = handle(&server, &conn, &hdr, &create_body).await;
+        assert_eq!(
+            create_resp.status,
+            ntstatus::STATUS_SUCCESS,
+            "setup: create the directory"
+        );
+
+        let open_body = create_request_bytes("existing_dir", FILE_DIRECTORY_FILE, FILE_OPEN);
+        let open_resp = handle(&server, &conn, &hdr, &open_body).await;
+        assert_eq!(
+            open_resp.status,
+            ntstatus::STATUS_SUCCESS,
+            "FILE_DIRECTORY_FILE + FILE_OPEN must survive Stage 1 and reach the backend"
+        );
     }
 }

@@ -133,6 +133,15 @@ impl ShareBackend for MemFsBackend {
         let kt = key(to);
         let mut g = self.inner.lock().unwrap();
 
+        // Source existence/kind MUST be settled before any destination
+        // mutation: an absent `from` must leave an existing `to` untouched,
+        // not be discovered only after `to` has already been removed.
+        let src_is_dir = g.dirs.contains_key(&kf);
+        let src_is_file = g.files.contains_key(&kf);
+        if !src_is_dir && !src_is_file {
+            return Err(SmbError::NotFound);
+        }
+
         let dest_is_file = g.files.contains_key(&kt);
         let dest_is_dir = g.dirs.contains_key(&kt);
         if dest_is_file || dest_is_dir {
@@ -144,7 +153,6 @@ impl ShareBackend for MemFsBackend {
             // otherwise the destination entry is removed first so the
             // insert below never leaves a stale sibling entry (a file and
             // a directory both present under the same key).
-            let src_is_dir = g.dirs.contains_key(&kf);
             if src_is_dir && dest_is_file {
                 return Err(SmbError::NotADirectory);
             }
@@ -166,7 +174,7 @@ impl ShareBackend for MemFsBackend {
             g.dirs.insert(kt, ());
             return Ok(());
         }
-        Err(SmbError::NotFound)
+        unreachable!("src_is_dir/src_is_file already confirmed one of these branches taken")
     }
 
     fn capabilities(&self) -> BackendCapabilities {
@@ -354,6 +362,24 @@ mod tests {
         assert_eq!(
             fs.inner.lock().unwrap().files.get("dst.txt"),
             Some(&b"old".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_true_missing_source_leaves_existing_destination_untouched() {
+        // Only the destination exists — `from` is absent. Even with
+        // replace=true this must fail NotFound and must not first remove
+        // the destination while discovering that.
+        let fs = MemFsBackend::new().with_file("dst.txt", b"untouched");
+        let err = fs
+            .rename(&p("src.txt"), &p("dst.txt"), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SmbError::NotFound), "got {err:?}");
+        assert_eq!(
+            fs.inner.lock().unwrap().files.get("dst.txt"),
+            Some(&b"untouched".to_vec()),
+            "the destination must survive a rename whose source never existed"
         );
     }
 

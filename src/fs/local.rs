@@ -413,8 +413,13 @@ impl ShareBackend for LocalFsBackend {
         spawn_blocking(move || -> io::Result<()> {
             // `replace == false`: reject overwrite explicitly — Unix
             // `rename(2)` would otherwise replace silently, and
-            // `ReplaceIfExists == 0` MUST NOT.
-            if !replace && root2.exists(&to_path) {
+            // `ReplaceIfExists == 0` MUST NOT. `symlink_metadata`, not
+            // `exists` (which follows symlinks via `metadata`/`stat`): a
+            // dangling symlink at `to_path` is still an existing directory
+            // entry — `stat`-through would see "nothing there" and let a
+            // `rename(2)` silently replace it, exactly the replace=false
+            // MUST NOT this guard exists for.
+            if !replace && root2.symlink_metadata(&to_path).is_ok() {
                 return Err(io::Error::from(io::ErrorKind::AlreadyExists));
             }
             // `replace == true`: a single `rename(2)` call, atomic-over-
@@ -866,6 +871,41 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, SmbError::Exists), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn replace_false_rejects_a_dangling_symlink_target() {
+        // `symlink_metadata` (lstat), not `exists` (`metadata`/`stat`,
+        // which follows the link): a dangling symlink is still an existing
+        // directory entry at `to_path`, and replace=false MUST reject it
+        // rather than let the OS `rename(2)` silently replace it.
+        let td = tempdir().unwrap();
+        let backend = LocalFsBackend::new(td.path()).unwrap();
+
+        let h = backend.open(&p("src.txt"), opts_create()).await.unwrap();
+        h.close().await.unwrap();
+        std::os::unix::fs::symlink(td.path().join("does_not_exist"), td.path().join("dangling"))
+            .unwrap();
+        assert!(
+            !td.path().join("dangling").exists(),
+            "sanity: a dangling symlink reports not-existing via stat-through"
+        );
+
+        let err = backend
+            .rename(&p("src.txt"), &p("dangling"), false)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, SmbError::Exists), "got {err:?}");
+        assert!(
+            td.path().join("src.txt").exists(),
+            "the source must be untouched after a rejected rename"
+        );
+        assert_eq!(
+            std::fs::read_link(td.path().join("dangling")).unwrap(),
+            td.path().join("does_not_exist"),
+            "the dangling symlink itself must be untouched"
+        );
     }
 
     // ── Step 3 (`docs/PLAN_smb_round_two.md`) — `ReplaceIfExists` matrix ───

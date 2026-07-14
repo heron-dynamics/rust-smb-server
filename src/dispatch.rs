@@ -716,6 +716,13 @@ mod tests {
         crate::proto::messages::EchoRequest::default()
             .write_to(&mut buf)
             .expect("encode echo body");
+        // MS-SMB2 §3.3.5.9.7: every non-final compound part MUST be
+        // 8-byte aligned. A real client pads for exactly this reason, and
+        // `next_command` (when the caller passes a nonzero value) already
+        // names that padded length — so the wire bytes must match it,
+        // using the same `align_8` the dispatcher's own response side
+        // uses, not an ad-hoc constant.
+        buf.resize(align_8(buf.len()), 0);
         buf
     }
 
@@ -737,7 +744,10 @@ mod tests {
         let server = test_server_with_sink(sink.clone());
         let conn = Arc::new(Connection::new(7, Uuid::nil(), 1024 * 1024, 1024 * 1024));
 
-        let sub_len = (SMB2_HEADER_LEN + 4) as u32; // header + 4-byte EchoRequest
+        // header (64) + 4-byte EchoRequest = 68, 8-byte-aligned up to 72
+        // (MS-SMB2 §3.3.5.9.7 — see `echo_subframe`'s padding).
+        let sub_len = align_8(SMB2_HEADER_LEN + 4) as u32;
+        assert_eq!(sub_len, 72);
         let mut frame = Vec::new();
         frame.extend(echo_subframe(42, sub_len));
         frame.extend(echo_subframe(42, sub_len));
