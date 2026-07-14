@@ -174,18 +174,22 @@ pub async fn handle(
     tree.opens.write().await.insert(file_id, open_arc);
     drop(tree);
 
+    // Parsed once, used both for the trace (if armed) and for any create
+    // context we actually respond to (currently: AAPL — see
+    // `build_aapl_response_context`). Malformed input degrades to "no
+    // contexts seen" rather than failing the CREATE outright: the request
+    // has already been authorized and opened by this point.
+    let parsed_contexts = crate::proto::messages::CreateContext::parse_chain(&req.create_contexts)
+        .unwrap_or_default();
+
     if server.trace_sink.is_some() {
-        let contexts = crate::proto::messages::CreateContext::parse_chain(&req.create_contexts)
-            .map(|chain| {
-                chain
-                    .into_iter()
-                    .map(|c| crate::trace::CreateContextInfo {
-                        name: c.name,
-                        data_len: c.data.len() as u32,
-                    })
-                    .collect()
+        let contexts = parsed_contexts
+            .iter()
+            .map(|c| crate::trace::CreateContextInfo {
+                name: c.name.clone(),
+                data_len: c.data.len() as u32,
             })
-            .unwrap_or_default();
+            .collect();
         crate::trace::record(
             &server.trace_sink,
             crate::trace::current_trace_key(),
@@ -208,6 +212,23 @@ pub async fn handle(
         );
     }
 
+    let aapl_response = parsed_contexts
+        .iter()
+        .find(|c| c.name == crate::proto::messages::CreateContext::NAME_AAPL)
+        .and_then(build_aapl_response_context);
+    let (create_contexts_offset, create_contexts_length, create_contexts) = match aapl_response {
+        Some(ctx) => {
+            let mut bytes = Vec::new();
+            crate::proto::messages::CreateContext::encode_chain(&[ctx], &mut bytes)
+                .expect("encode AAPL response context");
+            // 64-byte SMB2 header + CreateResponse's fixed 88-byte body —
+            // the only offset a create-contexts chain can start at, since
+            // CreateResponse carries no other variable-length field before it.
+            (152u32, bytes.len() as u32, bytes)
+        }
+        None => (0u32, 0u32, Vec::new()),
+    };
+
     let create_action = match intent {
         OpenIntent::Create => FILE_CREATED,
         OpenIntent::OpenOrCreate | OpenIntent::OverwriteOrCreate => FILE_OPENED,
@@ -227,13 +248,67 @@ pub async fn handle(
         file_attributes: info.attributes(),
         reserved2: 0,
         file_id,
-        create_contexts_offset: 0,
-        create_contexts_length: 0,
-        create_contexts: vec![],
+        create_contexts_offset,
+        create_contexts_length,
+        create_contexts,
     };
     let mut buf = Vec::new();
     resp.write_to(&mut buf).expect("encode");
     HandlerResponse::ok(buf)
+}
+
+/// `SMB2_CRTCTX_AAPL` "server query" (`docs/SMB_DEFECTS.md` S2/S10
+/// investigation, Step 2). Wire format per Apple's Time Machine over SMB
+/// spec and Samba's `vfs_fruit.c` `check_aapl()` (cross-checked against
+/// each other — see the `parse_chain` fixture tests in
+/// `proto/messages/create.rs`). Only `SERVER_CAPS` and `VOLUME_CAPS` are
+/// implemented, with the conservative/honest baseline (a UNIX-like server;
+/// no case-sensitivity claim, no Time-Machine-fullsync claim).
+/// `MODEL_INFO` is not implemented — if requested, that bit is simply
+/// absent from the reply bitmap rather than answered.
+const AAPL_CMD_SERVER_QUERY: u32 = 1;
+const AAPL_REQ_SERVER_CAPS: u64 = 0x1;
+const AAPL_REQ_VOLUME_CAPS: u64 = 0x2;
+const AAPL_SERVER_CAPS_UNIX_BASED: u64 = 0x4;
+
+fn build_aapl_response_context(
+    aapl: &crate::proto::messages::CreateContext,
+) -> Option<crate::proto::messages::CreateContext> {
+    // MS-SMB2 §2.2.13.2.10 / Apple's spec: the server query payload is
+    // always exactly 24 bytes (CommandCode, Reserved, RequestBitmap,
+    // ClientCapabilities). A different length or command isn't something
+    // this implementation understands; per MS-SMB2 §3.3.5.9.11 unknown or
+    // malformed contexts are ignored, not rejected.
+    if aapl.data.len() != 24 {
+        return None;
+    }
+    let command_code = u32::from_le_bytes(aapl.data[0..4].try_into().unwrap());
+    if command_code != AAPL_CMD_SERVER_QUERY {
+        return None;
+    }
+    let request_bitmap = u64::from_le_bytes(aapl.data[8..16].try_into().unwrap());
+
+    let mut reply_bitmap: u64 = 0;
+    let mut data = Vec::new();
+    if request_bitmap & AAPL_REQ_SERVER_CAPS != 0 {
+        reply_bitmap |= AAPL_REQ_SERVER_CAPS;
+        data.extend_from_slice(&AAPL_SERVER_CAPS_UNIX_BASED.to_le_bytes());
+    }
+    if request_bitmap & AAPL_REQ_VOLUME_CAPS != 0 {
+        reply_bitmap |= AAPL_REQ_VOLUME_CAPS;
+        data.extend_from_slice(&0u64.to_le_bytes());
+    }
+
+    let mut out = Vec::with_capacity(16 + data.len());
+    out.extend_from_slice(&AAPL_CMD_SERVER_QUERY.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+    out.extend_from_slice(&reply_bitmap.to_le_bytes());
+    out.extend_from_slice(&data);
+
+    Some(crate::proto::messages::CreateContext {
+        name: crate::proto::messages::CreateContext::NAME_AAPL.to_vec(),
+        data: out,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +367,15 @@ mod tests {
     }
 
     fn create_request_bytes(name: &str, create_options: u32, create_disposition: u32) -> Vec<u8> {
+        create_request_bytes_with_contexts(name, create_options, create_disposition, vec![])
+    }
+
+    fn create_request_bytes_with_contexts(
+        name: &str,
+        create_options: u32,
+        create_disposition: u32,
+        create_contexts: Vec<u8>,
+    ) -> Vec<u8> {
         let name_u16: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
         let req = CreateRequest {
             structure_size: 57,
@@ -307,14 +391,35 @@ mod tests {
             create_options,
             name_offset: 0x78,
             name_length: name_u16.len() as u16,
-            create_contexts_offset: 0,
-            create_contexts_length: 0,
+            create_contexts_offset: if create_contexts.is_empty() { 0 } else { 0x78 },
+            create_contexts_length: create_contexts.len() as u32,
             name: name_u16,
-            create_contexts: vec![],
+            create_contexts,
         };
         let mut buf = Vec::new();
         req.write_to(&mut buf).unwrap();
         buf
+    }
+
+    /// A real SMB2_CRTCTX_AAPL "server query" context requesting both
+    /// SERVER_CAPS (1) and VOLUME_CAPS (2) — the same shape a macOS client
+    /// sends on its first CREATE against a share (see the wire fixture in
+    /// `proto/messages/create.rs`'s `parse_chain_decodes_a_real_aapl_server_query_context`).
+    fn aapl_server_query_context_bytes(request_bitmap: u64, client_caps: u64) -> Vec<u8> {
+        let ctx = crate::proto::messages::CreateContext {
+            name: crate::proto::messages::CreateContext::NAME_AAPL.to_vec(),
+            data: {
+                let mut d = Vec::new();
+                d.extend_from_slice(&1u32.to_le_bytes()); // CommandCode = SERVER_QUERY
+                d.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+                d.extend_from_slice(&request_bitmap.to_le_bytes());
+                d.extend_from_slice(&client_caps.to_le_bytes());
+                d
+            },
+        };
+        let mut chain = Vec::new();
+        crate::proto::messages::CreateContext::encode_chain(&[ctx], &mut chain).unwrap();
+        chain
     }
 
     fn create_header(session_id: u64, tree_id: u32) -> Smb2Header {
@@ -426,5 +531,127 @@ mod tests {
             ntstatus::STATUS_SUCCESS,
             "FILE_DIRECTORY_FILE + FILE_OPEN must survive Stage 1 and reach the backend"
         );
+    }
+
+    // -- AAPL create context (docs/SMB_DEFECTS.md S2/S10, Step 2) ----------
+
+    #[test]
+    fn build_aapl_response_context_answers_both_requested_bitmaps() {
+        let req_ctx = crate::proto::messages::CreateContext {
+            name: crate::proto::messages::CreateContext::NAME_AAPL.to_vec(),
+            data: {
+                let mut d = Vec::new();
+                d.extend_from_slice(&1u32.to_le_bytes()); // SERVER_QUERY
+                d.extend_from_slice(&0u32.to_le_bytes());
+                d.extend_from_slice(&0x3u64.to_le_bytes()); // SERVER_CAPS | VOLUME_CAPS
+                d.extend_from_slice(&0xfu64.to_le_bytes());
+                d
+            },
+        };
+
+        let resp = build_aapl_response_context(&req_ctx).expect("must answer a well-formed query");
+        assert_eq!(resp.name, crate::proto::messages::CreateContext::NAME_AAPL);
+        // 16-byte header + 8 bytes SERVER_CAPS + 8 bytes VOLUME_CAPS.
+        assert_eq!(resp.data.len(), 32);
+        let command_code = u32::from_le_bytes(resp.data[0..4].try_into().unwrap());
+        let reply_bitmap = u64::from_le_bytes(resp.data[8..16].try_into().unwrap());
+        let server_caps = u64::from_le_bytes(resp.data[16..24].try_into().unwrap());
+        let volume_caps = u64::from_le_bytes(resp.data[24..32].try_into().unwrap());
+        assert_eq!(command_code, AAPL_CMD_SERVER_QUERY);
+        assert_eq!(reply_bitmap, 0x3);
+        assert_eq!(server_caps, AAPL_SERVER_CAPS_UNIX_BASED);
+        assert_eq!(volume_caps, 0);
+    }
+
+    #[test]
+    fn build_aapl_response_context_answers_only_the_requested_bitmap() {
+        let req_ctx = crate::proto::messages::CreateContext {
+            name: crate::proto::messages::CreateContext::NAME_AAPL.to_vec(),
+            data: {
+                let mut d = Vec::new();
+                d.extend_from_slice(&1u32.to_le_bytes());
+                d.extend_from_slice(&0u32.to_le_bytes());
+                d.extend_from_slice(&AAPL_REQ_SERVER_CAPS.to_le_bytes()); // SERVER_CAPS only
+                d.extend_from_slice(&0u64.to_le_bytes());
+                d
+            },
+        };
+
+        let resp = build_aapl_response_context(&req_ctx).expect("must answer a well-formed query");
+        // 16-byte header + 8 bytes SERVER_CAPS only — no VOLUME_CAPS bytes.
+        assert_eq!(resp.data.len(), 24);
+        let reply_bitmap = u64::from_le_bytes(resp.data[8..16].try_into().unwrap());
+        assert_eq!(reply_bitmap, AAPL_REQ_SERVER_CAPS);
+    }
+
+    #[test]
+    fn build_aapl_response_context_ignores_wrong_length_payload() {
+        let req_ctx = crate::proto::messages::CreateContext {
+            name: crate::proto::messages::CreateContext::NAME_AAPL.to_vec(),
+            data: vec![0u8; 16],
+        };
+        assert!(build_aapl_response_context(&req_ctx).is_none());
+    }
+
+    #[test]
+    fn build_aapl_response_context_ignores_unknown_command_code() {
+        let req_ctx = crate::proto::messages::CreateContext {
+            name: crate::proto::messages::CreateContext::NAME_AAPL.to_vec(),
+            data: {
+                let mut d = Vec::new();
+                d.extend_from_slice(&2u32.to_le_bytes()); // RESOLVE_ID, not SERVER_QUERY
+                d.extend_from_slice(&0u32.to_le_bytes());
+                d.extend_from_slice(&0x3u64.to_le_bytes());
+                d.extend_from_slice(&0u64.to_le_bytes());
+                d
+            },
+        };
+        assert!(build_aapl_response_context(&req_ctx).is_none());
+    }
+
+    #[tokio::test]
+    async fn create_response_carries_an_aapl_context_when_the_client_sends_one() {
+        let server = test_server();
+        let (conn, session_id, tree_id) = test_conn_with_tree(MemFsBackend::new()).await;
+        let hdr = create_header(session_id, tree_id);
+        let contexts = aapl_server_query_context_bytes(0x3, 0xf);
+        let body = create_request_bytes_with_contexts("aapl_probe", 0, FILE_CREATE, contexts);
+
+        let resp = handle(&server, &conn, &hdr, &body).await;
+        assert_eq!(resp.status, ntstatus::STATUS_SUCCESS);
+
+        let create_resp = CreateResponse::parse(&resp.body).expect("a well-formed CreateResponse");
+        assert_eq!(
+            create_resp.create_contexts_offset, 152,
+            "64-byte SMB2 header + 88-byte fixed CreateResponse body"
+        );
+        assert_eq!(
+            create_resp.create_contexts_length as usize,
+            create_resp.create_contexts.len()
+        );
+        let decoded =
+            crate::proto::messages::CreateContext::parse_chain(&create_resp.create_contexts)
+                .expect("response chain must parse");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(
+            decoded[0].name,
+            crate::proto::messages::CreateContext::NAME_AAPL
+        );
+    }
+
+    #[tokio::test]
+    async fn create_response_has_no_contexts_when_the_client_sends_none() {
+        let server = test_server();
+        let (conn, session_id, tree_id) = test_conn_with_tree(MemFsBackend::new()).await;
+        let hdr = create_header(session_id, tree_id);
+        let body = create_request_bytes("no_probe", 0, FILE_CREATE);
+
+        let resp = handle(&server, &conn, &hdr, &body).await;
+        assert_eq!(resp.status, ntstatus::STATUS_SUCCESS);
+
+        let create_resp = CreateResponse::parse(&resp.body).expect("a well-formed CreateResponse");
+        assert_eq!(create_resp.create_contexts_offset, 0);
+        assert_eq!(create_resp.create_contexts_length, 0);
+        assert!(create_resp.create_contexts.is_empty());
     }
 }
