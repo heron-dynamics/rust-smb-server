@@ -90,6 +90,11 @@ name = "integration_negotiate"
 path = "tests/integration_negotiate.rs"
 required-features = ["localfs"]
 
+[[test]]
+name = "integration_trace"
+path = "tests/integration_trace.rs"
+required-features = ["localfs"]
+
 [profile.release]
 opt-level = 3
 lto = true

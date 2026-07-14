@@ -92,7 +92,7 @@ pub async fn dispatch_frame(
     let mut prev_session_id = 0;
     let mut prev_tree_id = 0;
     let mut prev_create_file_id = None;
-    let mut compound_ordinal: u16 = 0;
+    let mut compound_ordinal: u32 = 0;
 
     while sub_offset < frame.len() {
         let available = &frame[sub_offset..];
@@ -293,7 +293,7 @@ async fn dispatch_one(
     server: &Arc<ServerState>,
     conn: &Arc<Connection>,
     frame: &[u8],
-    compound_ordinal: u16,
+    compound_ordinal: u32,
 ) -> Option<Vec<u8>> {
     let (req_hdr, body_bytes) = match Smb2Header::parse(frame) {
         Ok(p) => p,
@@ -661,6 +661,134 @@ mod tests {
 
     fn test_conn() -> Arc<Connection> {
         Arc::new(Connection::new(1, Uuid::nil(), 1024 * 1024, 1024 * 1024))
+    }
+
+    // ── Trace key generation through the real dispatcher (docs/PLAN_smb_round_two.md
+    // Step 1a/1b — the reviewed gate: not just two hand-built `TraceKey` values) ──
+
+    struct CaptureSink {
+        events: std::sync::Mutex<Vec<(Option<crate::trace::TraceKey>, String)>>,
+    }
+
+    impl crate::trace::TraceSink for CaptureSink {
+        fn record(&self, key: Option<crate::trace::TraceKey>, event: &crate::trace::TraceEvent) {
+            self.events
+                .lock()
+                .unwrap()
+                .push((key, format!("{event:?}")));
+        }
+    }
+
+    fn test_server_with_sink(sink: std::sync::Arc<CaptureSink>) -> Arc<ServerState> {
+        let cfg = crate::server::ServerConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            netbios_name: "TEST".to_owned(),
+            max_read_size: 1024 * 1024,
+            max_write_size: 1024 * 1024,
+            server_guid: Uuid::nil(),
+        };
+        let users = crate::server::ServerUsers {
+            table: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        };
+        let mut state = crate::server::ServerState::new(cfg, users, vec![]);
+        state.trace_sink = Some(sink as std::sync::Arc<dyn crate::trace::TraceSink>);
+        Arc::new(state)
+    }
+
+    /// One ECHO sub-frame — the simplest command needing no session/tree —
+    /// with `next_command` set by the caller to chain it into a compound
+    /// frame (`0` marks the last sub-frame in the chain).
+    fn echo_subframe(message_id: u64, next_command: u32) -> Vec<u8> {
+        let hdr = Smb2Header {
+            credit_charge: 1,
+            channel_sequence_status: 0,
+            command: Command::Echo,
+            credit_request_response: 1,
+            flags: 0,
+            next_command,
+            message_id,
+            tail: HeaderTail::sync(0),
+            session_id: 0,
+            signature: [0u8; 16],
+        };
+        let mut buf = Vec::new();
+        hdr.write(&mut buf).expect("encode header");
+        crate::proto::messages::EchoRequest::default()
+            .write_to(&mut buf)
+            .expect("encode echo body");
+        buf
+    }
+
+    fn request_keys(
+        events: &[(Option<crate::trace::TraceKey>, String)],
+    ) -> Vec<crate::trace::TraceKey> {
+        events
+            .iter()
+            .filter(|(_, text)| text.starts_with("Request"))
+            .map(|(key, _)| key.expect("a Request event must carry a key when a sink is armed"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn compound_frame_gets_sequential_ordinals_from_real_dispatch() {
+        let sink = std::sync::Arc::new(CaptureSink {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let server = test_server_with_sink(sink.clone());
+        let conn = Arc::new(Connection::new(7, Uuid::nil(), 1024 * 1024, 1024 * 1024));
+
+        let sub_len = (SMB2_HEADER_LEN + 4) as u32; // header + 4-byte EchoRequest
+        let mut frame = Vec::new();
+        frame.extend(echo_subframe(42, sub_len));
+        frame.extend(echo_subframe(42, sub_len));
+        frame.extend(echo_subframe(42, 0));
+
+        let resp = dispatch_frame(&server, &conn, &frame).await;
+        assert!(
+            resp.is_some(),
+            "a 3-op ECHO compound must produce a response"
+        );
+
+        let events = sink.events.lock().unwrap();
+        let mut ordinals: Vec<u32> = request_keys(&events)
+            .into_iter()
+            .map(|k| {
+                assert_eq!(k.connection_id, 7);
+                assert_eq!(k.message_id, 42);
+                k.compound_ordinal
+            })
+            .collect();
+        ordinals.sort_unstable();
+        assert_eq!(
+            ordinals,
+            vec![0, 1, 2],
+            "three compounded operations under one message_id must get three distinct, \
+             sequential ordinals from the real dispatch loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_real_connections_reusing_the_same_message_id_get_distinct_keys() {
+        let sink = std::sync::Arc::new(CaptureSink {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let server = test_server_with_sink(sink.clone());
+        let conn_a = Arc::new(Connection::new(1, Uuid::nil(), 1024 * 1024, 1024 * 1024));
+        let conn_b = Arc::new(Connection::new(2, Uuid::nil(), 1024 * 1024, 1024 * 1024));
+
+        let frame = echo_subframe(5, 0);
+        dispatch_frame(&server, &conn_a, &frame).await;
+        dispatch_frame(&server, &conn_b, &frame).await;
+
+        let events = sink.events.lock().unwrap();
+        let keys = request_keys(&events);
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].message_id, 5);
+        assert_eq!(keys[1].message_id, 5);
+        assert_ne!(
+            keys[0].connection_id, keys[1].connection_id,
+            "two distinct connections reusing message_id=5 must not collide"
+        );
     }
 
     fn negotiated_preauth() -> PreauthIntegrity {

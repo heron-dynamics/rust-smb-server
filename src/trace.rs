@@ -21,12 +21,16 @@ use std::sync::Arc;
 /// request carries several operations under one `message_id` — so neither
 /// `message_id` alone, nor `(connection_id, message_id)`, is unique.
 /// `compound_ordinal` is the operation's index within its compound chain (0
-/// when the request is not compounded).
+/// when the request is not compounded). `u32`, not `u16`: a direct-TCP frame
+/// may be up to 16 MiB (`SMB2_HEADER_LEN` = 64 bytes per sub-header floor),
+/// so a compound chain of small sub-commands can exceed 65536 operations —
+/// `u16` would silently collide past that point, which is exactly the
+/// uniqueness `D-transport-diagnostics` requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TraceKey {
     pub connection_id: u64,
     pub message_id: u64,
-    pub compound_ordinal: u16,
+    pub compound_ordinal: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -57,6 +61,12 @@ pub enum TraceEvent {
     /// `create.rs`.
     Create {
         path: String,
+        /// The raw `CreateOptions` field (MS-SMB2 §2.2.13) — `directory`/
+        /// `non_directory` below are a convenience decode of two of its
+        /// bits; every other bit (e.g. `FILE_DELETE_ON_CLOSE`,
+        /// `FILE_NO_INTERMEDIATE_BUFFERING`) is otherwise unrecoverable
+        /// from the trace once decoded away.
+        create_options: u32,
         directory: bool,
         non_directory: bool,
         create_disposition: u32,

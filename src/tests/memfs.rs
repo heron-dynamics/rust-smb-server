@@ -53,6 +53,16 @@ fn key(path: &SmbPath) -> String {
     path.display_backslash()
 }
 
+/// `true` if any file or directory is an immediate or deeper child of
+/// `dir_key` — mirrors `MemHandle::list_dir`'s own prefix convention
+/// (`"{dir}\\"`), so "non-empty" here means exactly what a listing would
+/// show.
+fn has_children(inner: &MemInner, dir_key: &str) -> bool {
+    let prefix = format!("{dir_key}\\");
+    inner.files.keys().any(|k| k.starts_with(&prefix))
+        || inner.dirs.keys().any(|k| k.starts_with(&prefix))
+}
+
 #[async_trait]
 impl ShareBackend for MemFsBackend {
     async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
@@ -122,9 +132,32 @@ impl ShareBackend for MemFsBackend {
         let kf = key(from);
         let kt = key(to);
         let mut g = self.inner.lock().unwrap();
-        if !replace && (g.files.contains_key(&kt) || g.dirs.contains_key(&kt)) {
-            return Err(SmbError::Exists);
+
+        let dest_is_file = g.files.contains_key(&kt);
+        let dest_is_dir = g.dirs.contains_key(&kt);
+        if dest_is_file || dest_is_dir {
+            if !replace {
+                return Err(SmbError::Exists);
+            }
+            // `replace == true`: mirror Unix `rename(2)` semantics — kind
+            // mismatches and a non-empty directory target are rejected;
+            // otherwise the destination entry is removed first so the
+            // insert below never leaves a stale sibling entry (a file and
+            // a directory both present under the same key).
+            let src_is_dir = g.dirs.contains_key(&kf);
+            if src_is_dir && dest_is_file {
+                return Err(SmbError::NotADirectory);
+            }
+            if !src_is_dir && dest_is_dir {
+                return Err(SmbError::IsDirectory);
+            }
+            if dest_is_dir && has_children(&g, &kt) {
+                return Err(SmbError::NotEmpty);
+            }
+            g.files.remove(&kt);
+            g.dirs.remove(&kt);
         }
+
         if let Some(data) = g.files.remove(&kf) {
             g.files.insert(kt, data);
             return Ok(());
@@ -296,5 +329,125 @@ impl Handle for MemHandle {
 
     async fn close(self: Box<Self>) -> SmbResult<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(s: &str) -> SmbPath {
+        s.parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn replace_false_rejects_existing_destination() {
+        let fs = MemFsBackend::new()
+            .with_file("src.txt", b"new")
+            .with_file("dst.txt", b"old");
+        let err = fs
+            .rename(&p("src.txt"), &p("dst.txt"), false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SmbError::Exists));
+        // Destination untouched.
+        assert_eq!(
+            fs.inner.lock().unwrap().files.get("dst.txt"),
+            Some(&b"old".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_true_replaces_existing_file_without_a_stale_sibling() {
+        let fs = MemFsBackend::new()
+            .with_file("src.txt", b"new")
+            .with_file("dst.txt", b"old");
+        fs.rename(&p("src.txt"), &p("dst.txt"), true).await.unwrap();
+        let inner = fs.inner.lock().unwrap();
+        assert_eq!(inner.files.get("dst.txt"), Some(&b"new".to_vec()));
+        assert!(!inner.files.contains_key("src.txt"));
+        assert!(!inner.dirs.contains_key("dst.txt"));
+    }
+
+    #[tokio::test]
+    async fn replace_true_rejects_directory_over_file_kind_mismatch() {
+        let fs = MemFsBackend::new().with_file("dst.txt", b"x");
+        fs.open(
+            &p("src_dir"),
+            OpenOptions {
+                directory: true,
+                intent: OpenIntent::Create,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = fs
+            .rename(&p("src_dir"), &p("dst.txt"), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SmbError::NotADirectory), "got {err:?}");
+        // Neither side must have been mutated.
+        let inner = fs.inner.lock().unwrap();
+        assert!(inner.dirs.contains_key("src_dir"));
+        assert_eq!(inner.files.get("dst.txt"), Some(&b"x".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn replace_true_rejects_file_over_directory_kind_mismatch() {
+        let fs = MemFsBackend::new().with_file("src.txt", b"x");
+        fs.open(
+            &p("dst_dir"),
+            OpenOptions {
+                directory: true,
+                intent: OpenIntent::Create,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = fs
+            .rename(&p("src.txt"), &p("dst_dir"), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SmbError::IsDirectory), "got {err:?}");
+        let inner = fs.inner.lock().unwrap();
+        assert!(inner.files.contains_key("src.txt"));
+        assert!(inner.dirs.contains_key("dst_dir"));
+    }
+
+    #[tokio::test]
+    async fn replace_true_rejects_non_empty_directory_target() {
+        let fs = MemFsBackend::new()
+            .with_file("src_dir\\inside_src", b"x")
+            .with_file("dst_dir\\inside_dst", b"y");
+        {
+            let mut inner = fs.inner.lock().unwrap();
+            inner.dirs.insert("src_dir".to_string(), ());
+            inner.dirs.insert("dst_dir".to_string(), ());
+        }
+
+        let err = fs
+            .rename(&p("src_dir"), &p("dst_dir"), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SmbError::NotEmpty), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn replace_true_replaces_an_empty_directory() {
+        let fs = MemFsBackend::new();
+        {
+            let mut inner = fs.inner.lock().unwrap();
+            inner.dirs.insert("src_dir".to_string(), ());
+            inner.dirs.insert("dst_dir".to_string(), ());
+        }
+
+        fs.rename(&p("src_dir"), &p("dst_dir"), true).await.unwrap();
+        let inner = fs.inner.lock().unwrap();
+        assert!(!inner.dirs.contains_key("src_dir"));
+        assert!(inner.dirs.contains_key("dst_dir"));
     }
 }

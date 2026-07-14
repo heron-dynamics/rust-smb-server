@@ -191,6 +191,7 @@ pub async fn handle(
             crate::trace::current_trace_key(),
             crate::trace::TraceEvent::Create {
                 path: path_for_trace,
+                create_options: req.create_options,
                 directory,
                 non_directory,
                 create_disposition: req.create_disposition,
@@ -233,4 +234,170 @@ pub async fn handle(
     let mut buf = Vec::new();
     resp.write_to(&mut buf).expect("encode");
     HandlerResponse::ok(buf)
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1 handler tests (`docs/PLAN_smb_round_two.md` Step 2)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conn::state::{Session, TreeConnect};
+    use crate::proto::auth::ntlm::Identity;
+    use crate::proto::header::HeaderTail;
+    use crate::server::{ServerConfig, ServerState, ServerUsers, ShareBindings, ShareMode};
+    use crate::tests::memfs::MemFsBackend;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    fn test_server() -> Arc<ServerState> {
+        let cfg = ServerConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            netbios_name: "TEST".to_string(),
+            max_read_size: 1024 * 1024,
+            max_write_size: 1024 * 1024,
+            server_guid: Uuid::nil(),
+        };
+        let users = ServerUsers {
+            table: tokio::sync::RwLock::new(HashMap::new()),
+        };
+        Arc::new(ServerState::new(cfg, users, vec![]))
+    }
+
+    /// A connection with one anonymous session and one tree bound to a
+    /// fresh `MemFsBackend`. Returns `(conn, session_id, tree_id)`.
+    async fn test_conn_with_tree(backend: MemFsBackend) -> (Arc<Connection>, u64, u32) {
+        let conn = Arc::new(Connection::new(1, Uuid::nil(), 1024 * 1024, 1024 * 1024));
+        let session = Session::new(1, Identity::Anonymous, [0; 16], [0; 16], false, None);
+        let session = Arc::new(tokio::sync::RwLock::new(session));
+        let share = ShareBindings::new(
+            "share".to_string(),
+            Arc::new(backend),
+            ShareMode::Public,
+            HashMap::new(),
+            false,
+        );
+        let tree = Arc::new(tokio::sync::RwLock::new(TreeConnect::new(
+            1,
+            share,
+            Access::ReadWrite,
+        )));
+        {
+            let sess = session.read().await;
+            sess.trees.write().await.insert(1, tree);
+        }
+        conn.sessions.write().await.insert(1, session);
+        (conn, 1, 1)
+    }
+
+    fn create_request_bytes(name: &str, create_options: u32, create_disposition: u32) -> Vec<u8> {
+        let name_u16: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let req = CreateRequest {
+            structure_size: 57,
+            security_flags: 0,
+            requested_oplock_level: 0,
+            impersonation_level: 2,
+            smb_create_flags: 0,
+            reserved: 0,
+            desired_access: 0x0012_0089,
+            file_attributes: 0,
+            share_access: 0x0000_0007,
+            create_disposition,
+            create_options,
+            name_offset: 0x78,
+            name_length: name_u16.len() as u16,
+            create_contexts_offset: 0,
+            create_contexts_length: 0,
+            name: name_u16,
+            create_contexts: vec![],
+        };
+        let mut buf = Vec::new();
+        req.write_to(&mut buf).unwrap();
+        buf
+    }
+
+    fn create_header(session_id: u64, tree_id: u32) -> Smb2Header {
+        Smb2Header {
+            credit_charge: 1,
+            channel_sequence_status: 0,
+            command: crate::proto::header::Command::Create,
+            credit_request_response: 1,
+            flags: 0,
+            next_command: 0,
+            message_id: 1,
+            tail: HeaderTail::sync(tree_id),
+            session_id,
+            signature: [0u8; 16],
+        }
+    }
+
+    #[tokio::test]
+    async fn both_directory_constraint_flags_set_is_invalid_parameter() {
+        let server = test_server();
+        let (conn, session_id, tree_id) = test_conn_with_tree(MemFsBackend::new()).await;
+        let hdr = create_header(session_id, tree_id);
+        let body = create_request_bytes(
+            "x",
+            FILE_DIRECTORY_FILE | FILE_NON_DIRECTORY_FILE,
+            FILE_OPEN,
+        );
+
+        let resp = handle(&server, &conn, &hdr, &body).await;
+        assert_eq!(resp.status, ntstatus::STATUS_INVALID_PARAMETER);
+    }
+
+    #[tokio::test]
+    async fn directory_flag_with_overwrite_if_disposition_is_invalid_parameter() {
+        let server = test_server();
+        let (conn, session_id, tree_id) = test_conn_with_tree(MemFsBackend::new()).await;
+        let hdr = create_header(session_id, tree_id);
+        // FILE_SUPERSEDE (0) and FILE_OVERWRITE_IF (5) both fold to
+        // `OpenIntent::OverwriteOrCreate` — both must be rejected paired
+        // with FILE_DIRECTORY_FILE.
+        for disposition in [FILE_SUPERSEDE, FILE_OVERWRITE_IF] {
+            let body = create_request_bytes("x", FILE_DIRECTORY_FILE, disposition);
+            let resp = handle(&server, &conn, &hdr, &body).await;
+            assert_eq!(
+                resp.status,
+                ntstatus::STATUS_INVALID_PARAMETER,
+                "disposition {disposition:#x}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_flag_with_overwrite_disposition_is_invalid_parameter() {
+        let server = test_server();
+        let (conn, session_id, tree_id) = test_conn_with_tree(MemFsBackend::new()).await;
+        let hdr = create_header(session_id, tree_id);
+        let body = create_request_bytes("x", FILE_DIRECTORY_FILE, FILE_OVERWRITE);
+
+        let resp = handle(&server, &conn, &hdr, &body).await;
+        assert_eq!(resp.status, ntstatus::STATUS_INVALID_PARAMETER);
+    }
+
+    #[tokio::test]
+    async fn directory_flag_with_creating_dispositions_survives_stage1() {
+        let server = test_server();
+        let (conn, session_id, tree_id) = test_conn_with_tree(MemFsBackend::new()).await;
+        let hdr = create_header(session_id, tree_id);
+
+        // FILE_CREATE, FILE_OPEN_IF, FILE_OPEN are the only three
+        // dispositions Stage 1 permits paired with FILE_DIRECTORY_FILE —
+        // each must reach the backend (a fresh MemFsBackend has no
+        // "newdir", so both creating dispositions succeed by creating it).
+        for (disposition, name) in [
+            (FILE_CREATE, "newdir_create"),
+            (FILE_OPEN_IF, "newdir_openif"),
+        ] {
+            let body = create_request_bytes(name, FILE_DIRECTORY_FILE, disposition);
+            let resp = handle(&server, &conn, &hdr, &body).await;
+            assert_eq!(
+                resp.status,
+                ntstatus::STATUS_SUCCESS,
+                "disposition {disposition:#x} must survive Stage 1 and reach the backend"
+            );
+        }
+    }
 }

@@ -377,15 +377,19 @@ impl ShareBackend for LocalFsBackend {
         let root = Arc::clone(&self.root);
 
         spawn_blocking(move || -> io::Result<()> {
-            match root.remove_file(&rel) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == io::ErrorKind::IsADirectory => {
-                    // Caller's intent was "delete this name"; if it turned
-                    // out to be a directory, fall back to remove_dir which
-                    // refuses non-empty dirs (mapped to NotEmpty above).
-                    root.remove_dir(&rel)
-                }
-                Err(e) => Err(e),
+            // Stat first to decide `remove_file` vs `remove_dir`, rather
+            // than trying `remove_file` and inferring "it was a directory"
+            // from the error kind: POSIX `unlink(2)` on a directory is not
+            // uniformly `EISDIR` — on macOS/BSD it is `EPERM`
+            // (`io::ErrorKind::PermissionDenied`), which the old
+            // error-kind-sniffing fallback never matched, so directory
+            // removal silently surfaced as `AccessDenied` instead of ever
+            // reaching `remove_dir` (and its proper `NotEmpty`/success
+            // outcomes).
+            if root.symlink_metadata(&rel)?.is_dir() {
+                root.remove_dir(&rel)
+            } else {
+                root.remove_file(&rel)
             }
         })
         .await
