@@ -434,4 +434,130 @@ mod tests {
         let decoded = CreateContext::parse_chain(&buf).unwrap();
         assert!(decoded.is_empty());
     }
+
+    /// A hand-built wire fixture, not round-tripped through our own
+    /// `encode_chain` — this is what a real macOS client's SMB2_CRTCTX_AAPL
+    /// "server query" create context looks like on the wire (per Apple's
+    /// Time Machine over SMB spec and Samba's `vfs_fruit.c` check_aapl(),
+    /// cross-checked against each other): a single, last (`Next == 0`)
+    /// context named "AAPL" with a 24-byte payload —
+    /// CommandCode(4)=SERVER_QUERY(1), Reserved(4), RequestBitmap(8),
+    /// ClientCapabilities(8). This is Step 1 of the S2/S10 investigation
+    /// (`docs/SMB_DEFECTS.md`): confirm `parse_chain` decodes a real AAPL
+    /// context correctly before concluding anything about whether the
+    /// client sends one.
+    #[test]
+    fn parse_chain_decodes_a_real_aapl_server_query_context() {
+        #[rustfmt::skip]
+        let chain: &[u8] = &[
+            // Next (4) = 0 — this is the only/last entry.
+            0x00, 0x00, 0x00, 0x00,
+            // NameOffset (2) = 16
+            0x10, 0x00,
+            // NameLength (2) = 4
+            0x04, 0x00,
+            // Reserved (2)
+            0x00, 0x00,
+            // DataOffset (2) = 24
+            0x18, 0x00,
+            // DataLength (4) = 24
+            0x18, 0x00, 0x00, 0x00,
+            // Name: "AAPL"
+            b'A', b'A', b'P', b'L',
+            // 4-byte pad to align data at offset 24
+            0x00, 0x00, 0x00, 0x00,
+            // Data[0..4]: CommandCode = SMB2_CRTCTX_AAPL_SERVER_QUERY (1)
+            0x01, 0x00, 0x00, 0x00,
+            // Data[4..8]: Reserved
+            0x00, 0x00, 0x00, 0x00,
+            // Data[8..16]: RequestBitmap = SERVER_CAPS|VOLUME_CAPS|MODEL_INFO (1|2|4=7)
+            0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // Data[16..24]: ClientCapabilities = 0xf
+            0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let decoded =
+            CreateContext::parse_chain(chain).expect("a well-formed AAPL context must parse");
+        assert_eq!(
+            decoded.len(),
+            1,
+            "expected exactly one context, got {decoded:?}"
+        );
+        assert_eq!(
+            decoded[0].name, b"AAPL",
+            "context name must decode to literal AAPL, got {:?}",
+            decoded[0].name
+        );
+        assert_eq!(
+            decoded[0].data.len(),
+            24,
+            "AAPL server-query payload must be 24 bytes"
+        );
+
+        let command_code = u32::from_le_bytes(decoded[0].data[0..4].try_into().unwrap());
+        let request_bitmap = u64::from_le_bytes(decoded[0].data[8..16].try_into().unwrap());
+        let client_caps = u64::from_le_bytes(decoded[0].data[16..24].try_into().unwrap());
+        assert_eq!(
+            command_code, 1,
+            "CommandCode must decode to SERVER_QUERY (1)"
+        );
+        assert_eq!(
+            request_bitmap, 7,
+            "RequestBitmap must decode to SERVER_CAPS|VOLUME_CAPS|MODEL_INFO"
+        );
+        assert_eq!(client_caps, 0xf, "ClientCapabilities must decode to 0xf");
+    }
+
+    /// The same fixture, but preceded by a `DHnQ` context in the chain —
+    /// the actual macOS client sends AAPL compounded with other contexts,
+    /// not alone, so `Next` must be honoured correctly to reach it.
+    #[test]
+    fn parse_chain_finds_aapl_when_preceded_by_another_context() {
+        #[rustfmt::skip]
+        let first: &[u8] = &[
+            // Next (4) = 40 (16-byte header + 4-byte name + 4-byte pad + 16-byte
+            // DHnQ payload — already 8-aligned)
+            0x28, 0x00, 0x00, 0x00,
+            // NameOffset = 16, NameLength = 4
+            0x10, 0x00, 0x04, 0x00,
+            // Reserved
+            0x00, 0x00,
+            // DataOffset = 24, DataLength = 16
+            0x18, 0x00, 0x10, 0x00, 0x00, 0x00,
+            // Name: "DHnQ"
+            b'D', b'H', b'n', b'Q',
+            // 4-byte pad
+            0x00, 0x00, 0x00, 0x00,
+            // 16 bytes of durable-handle-request payload (irrelevant content)
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        #[rustfmt::skip]
+        let second: &[u8] = &[
+            0x00, 0x00, 0x00, 0x00,
+            0x10, 0x00, 0x04, 0x00,
+            0x00, 0x00,
+            0x18, 0x00, 0x18, 0x00, 0x00, 0x00,
+            b'A', b'A', b'P', b'L',
+            0x00, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            first.len(),
+            0x28,
+            "sanity: first entry must be exactly Next=0x28 bytes long"
+        );
+        let mut chain = Vec::new();
+        chain.extend_from_slice(first);
+        chain.extend_from_slice(second);
+
+        let decoded =
+            CreateContext::parse_chain(&chain).expect("a well-formed two-entry chain must parse");
+        assert_eq!(decoded.len(), 2, "expected DHnQ then AAPL, got {decoded:?}");
+        assert_eq!(decoded[0].name, b"DHnQ");
+        assert_eq!(decoded[1].name, b"AAPL");
+        assert_eq!(decoded[1].data.len(), 24);
+    }
 }
