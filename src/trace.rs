@@ -71,7 +71,14 @@ pub enum TraceEvent {
         non_directory: bool,
         create_disposition: u32,
         desired_access: u32,
-        file_id: [u8; 16],
+        /// `None` when `backend.open()` failed — MS-SMB2 assigns no FileId
+        /// to a CREATE that never opened anything. Recorded regardless of
+        /// outcome (`docs/SMB_DEFECTS.md` hygiene gap #6 in the prosopon
+        /// consumer): a failing CREATE's disposition/access-mask is exactly
+        /// what's needed to tell a server-side rejection apart from a
+        /// client that never attempted what the trace's surrounding
+        /// context assumed it would.
+        file_id: Option<[u8; 16]>,
         contexts: Vec<CreateContextInfo>,
     },
     /// `set_info.rs`, `FILE_RENAME_INFORMATION`: the `ReplaceIfExists` byte,

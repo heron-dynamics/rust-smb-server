@@ -147,10 +147,48 @@ pub async fn handle(
         delete_on_close,
     };
 
+    // Parsed once, used both for the trace (if armed) and for any create
+    // context we actually respond to (currently: AAPL — see
+    // `build_aapl_response_context`). Malformed input degrades to "no
+    // contexts seen" rather than failing the CREATE outright.
+    let parsed_contexts = crate::proto::messages::CreateContext::parse_chain(&req.create_contexts)
+        .unwrap_or_default();
+    let path_for_trace = path.display_backslash();
+    let record_create_trace = |file_id: Option<[u8; 16]>| {
+        if server.trace_sink.is_none() {
+            return;
+        }
+        let contexts = parsed_contexts
+            .iter()
+            .map(|c| crate::trace::CreateContextInfo {
+                name: c.name.clone(),
+                data_len: c.data.len() as u32,
+            })
+            .collect();
+        crate::trace::record(
+            &server.trace_sink,
+            crate::trace::current_trace_key(),
+            crate::trace::TraceEvent::Create {
+                path: path_for_trace.clone(),
+                create_options: req.create_options,
+                directory,
+                non_directory,
+                create_disposition: req.create_disposition,
+                desired_access: req.desired_access,
+                file_id,
+                contexts,
+            },
+        );
+    };
+
     let handle = match backend.open(&path, opts).await {
         Ok(h) => h,
         Err(e) => {
             debug!(error = %e, path = %path, "backend open failed");
+            // Traced regardless of outcome (`docs/SMB_DEFECTS.md` hygiene
+            // gap #6 in the prosopon consumer) — a failing CREATE never
+            // gets a FileId, so `file_id: None`.
+            record_create_trace(None);
             return HandlerResponse::err(e.to_nt_status());
         }
     };
@@ -160,6 +198,7 @@ pub async fn handle(
         Ok(i) => i,
         Err(e) => {
             let _ = handle.close().await;
+            record_create_trace(None);
             return HandlerResponse::err(e.to_nt_status());
         }
     };
@@ -167,7 +206,6 @@ pub async fn handle(
     // Allocate FileId, register Open.
     let tree = tree_arc.write().await;
     let file_id = tree.alloc_file_id();
-    let path_for_trace = path.display_backslash();
     let open = Open::new(
         file_id,
         handle,
@@ -180,43 +218,15 @@ pub async fn handle(
     tree.opens.write().await.insert(file_id, open_arc);
     drop(tree);
 
-    // Parsed once, used both for the trace (if armed) and for any create
-    // context we actually respond to (currently: AAPL — see
-    // `build_aapl_response_context`). Malformed input degrades to "no
-    // contexts seen" rather than failing the CREATE outright: the request
-    // has already been authorized and opened by this point.
-    let parsed_contexts = crate::proto::messages::CreateContext::parse_chain(&req.create_contexts)
-        .unwrap_or_default();
-
-    if server.trace_sink.is_some() {
-        let contexts = parsed_contexts
-            .iter()
-            .map(|c| crate::trace::CreateContextInfo {
-                name: c.name.clone(),
-                data_len: c.data.len() as u32,
-            })
-            .collect();
-        crate::trace::record(
-            &server.trace_sink,
-            crate::trace::current_trace_key(),
-            crate::trace::TraceEvent::Create {
-                path: path_for_trace,
-                create_options: req.create_options,
-                directory,
-                non_directory,
-                create_disposition: req.create_disposition,
-                desired_access: req.desired_access,
-                file_id: [
-                    file_id.persistent.to_le_bytes(),
-                    file_id.volatile.to_le_bytes(),
-                ]
-                .concat()
-                .try_into()
-                .expect("FileId is 16 bytes"),
-                contexts,
-            },
-        );
-    }
+    record_create_trace(Some(
+        [
+            file_id.persistent.to_le_bytes(),
+            file_id.volatile.to_le_bytes(),
+        ]
+        .concat()
+        .try_into()
+        .expect("FileId is 16 bytes"),
+    ));
 
     let aapl_response = parsed_contexts
         .iter()
@@ -698,5 +708,95 @@ mod tests {
         assert_eq!(create_resp.create_contexts_offset, 0);
         assert_eq!(create_resp.create_contexts_length, 0);
         assert!(create_resp.create_contexts.is_empty());
+    }
+
+    // -- Trace hygiene: CREATE is traced on failure too (docs/SMB_DEFECTS.md
+    // -- hygiene gap #6 / S9 investigation) -----------------------------------
+
+    struct CaptureSink {
+        events: std::sync::Mutex<Vec<crate::trace::TraceEvent>>,
+    }
+
+    impl crate::trace::TraceSink for CaptureSink {
+        fn record(&self, _key: Option<crate::trace::TraceKey>, event: &crate::trace::TraceEvent) {
+            self.events.lock().unwrap().push(event.clone());
+        }
+    }
+
+    fn test_server_with_sink() -> (Arc<ServerState>, Arc<CaptureSink>) {
+        let cfg = ServerConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            netbios_name: "TEST".to_string(),
+            max_read_size: 1024 * 1024,
+            max_write_size: 1024 * 1024,
+            server_guid: Uuid::nil(),
+        };
+        let users = ServerUsers {
+            table: tokio::sync::RwLock::new(HashMap::new()),
+        };
+        let sink = Arc::new(CaptureSink {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut server = ServerState::new(cfg, users, vec![]);
+        server.trace_sink = Some(sink.clone() as Arc<dyn crate::trace::TraceSink>);
+        (Arc::new(server), sink)
+    }
+
+    #[tokio::test]
+    async fn create_is_traced_with_no_file_id_when_the_backend_rejects_it() {
+        let (server, sink) = test_server_with_sink();
+        let (conn, session_id, tree_id) = test_conn_with_tree(MemFsBackend::new()).await;
+        let hdr = create_header(session_id, tree_id);
+
+        // FILE_OPEN against a path that doesn't exist — backend.open()
+        // returns NotFound, never reaching FileId allocation.
+        let body = create_request_bytes("ghost.txt", 0, FILE_OPEN);
+        let resp = handle(&server, &conn, &hdr, &body).await;
+        assert_eq!(resp.status, ntstatus::STATUS_OBJECT_NAME_NOT_FOUND);
+
+        let events = sink.events.lock().unwrap();
+        let create_event = events
+            .iter()
+            .find(|e| matches!(e, crate::trace::TraceEvent::Create { .. }))
+            .expect("a failing CREATE must still be traced");
+        match create_event {
+            crate::trace::TraceEvent::Create {
+                path,
+                create_disposition,
+                file_id,
+                ..
+            } => {
+                assert_eq!(path, "ghost.txt");
+                assert_eq!(*create_disposition, FILE_OPEN);
+                assert_eq!(
+                    *file_id, None,
+                    "a CREATE that never opened anything gets no FileId"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_is_traced_with_a_file_id_on_success() {
+        let (server, sink) = test_server_with_sink();
+        let (conn, session_id, tree_id) = test_conn_with_tree(MemFsBackend::new()).await;
+        let hdr = create_header(session_id, tree_id);
+
+        let body = create_request_bytes("new.txt", 0, FILE_CREATE);
+        let resp = handle(&server, &conn, &hdr, &body).await;
+        assert_eq!(resp.status, ntstatus::STATUS_SUCCESS);
+
+        let events = sink.events.lock().unwrap();
+        let create_event = events
+            .iter()
+            .find(|e| matches!(e, crate::trace::TraceEvent::Create { .. }))
+            .expect("a successful CREATE must be traced");
+        match create_event {
+            crate::trace::TraceEvent::Create { file_id, .. } => {
+                assert!(file_id.is_some(), "a successful CREATE gets a real FileId");
+            }
+            _ => unreachable!(),
+        }
     }
 }
