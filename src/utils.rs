@@ -57,6 +57,52 @@ pub fn utf16le_to_units(bytes: &[u8]) -> Option<Vec<u16>> {
     )
 }
 
+/// Match an SMB directory entry name against the subset of DOS wildcard
+/// syntax supported by v1. `?` matches one character, `*` matches any
+/// sequence, and comparison is ASCII case-insensitive. Empty, `*`, and `*.*`
+/// are the conventional match-all patterns used by SMB clients.
+pub(crate) fn dos_pattern_matches(pattern: &str, name: &str) -> bool {
+    if pattern.is_empty() || pattern == "*" || pattern == "*.*" {
+        return true;
+    }
+
+    // Walk both strings as char vectors so `?` matches a char rather than a
+    // byte, without going through grapheme territory.
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    dos_pattern_matches_inner(&pattern, &name)
+}
+
+fn dos_pattern_matches_inner(pattern: &[char], name: &[char]) -> bool {
+    let mut pattern_index = 0usize;
+    let mut name_index = 0usize;
+    let mut star: Option<(usize, usize)> = None;
+
+    while name_index < name.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '?'
+                || pattern[pattern_index].eq_ignore_ascii_case(&name[name_index]))
+        {
+            pattern_index += 1;
+            name_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            star = Some((pattern_index + 1, name_index));
+            pattern_index += 1;
+        } else if let Some((after_star, star_name_index)) = star {
+            pattern_index = after_star;
+            name_index = star_name_index + 1;
+            star = Some((after_star, star_name_index + 1));
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
 /// Fill `out` with cryptographically-strong random bytes via `getrandom`.
 /// Falls back to zeros if the OS RNG fails — the caller should treat this as
 /// fatal, but we never panic.
@@ -65,5 +111,24 @@ pub fn fill_random(out: &mut [u8]) {
         for b in out.iter_mut() {
             *b = 0;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dos_pattern_matching() {
+        assert!(dos_pattern_matches("", "anything"));
+        assert!(dos_pattern_matches("*", "anything"));
+        assert!(dos_pattern_matches("*.*", "README"));
+        assert!(dos_pattern_matches("*.txt", "foo.txt"));
+        assert!(!dos_pattern_matches("*.txt", "foo.log"));
+        assert!(dos_pattern_matches("a?c", "abc"));
+        assert!(!dos_pattern_matches("a?c", "ac"));
+        assert!(dos_pattern_matches("a*b*c", "axxxbxxxc"));
+        assert!(dos_pattern_matches("FOO", "foo"));
+        assert!(!dos_pattern_matches("new.txt", "pre_existing.txt"));
     }
 }

@@ -33,6 +33,7 @@ use crate::backend::{
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
+use crate::utils::dos_pattern_matches;
 
 // ---------------------------------------------------------------------------
 // Backend
@@ -170,52 +171,6 @@ fn file_info_from_metadata(name: String, md: &cap_std::fs::Metadata) -> FileInfo
         // public API; the dispatcher substitutes the FileId where needed.
         file_index: 0,
     }
-}
-
-// ---------------------------------------------------------------------------
-// DOS glob matching
-// ---------------------------------------------------------------------------
-
-/// Match `name` against a DOS-style pattern. `?` matches any single char,
-/// `*` matches any sequence (possibly empty). Comparison is case-insensitive
-/// (ASCII fold) — sufficient for the v1 use-case where names are validated to
-/// be free of weird Unicode tricks.
-fn glob_match(pattern: &str, name: &str) -> bool {
-    // Walk both strings as char vectors so `?` matches a char rather than a
-    // byte, without going through grapheme territory.
-    let p: Vec<char> = pattern.chars().collect();
-    let n: Vec<char> = name.chars().collect();
-    glob_match_inner(&p, &n)
-}
-
-fn glob_match_inner(p: &[char], n: &[char]) -> bool {
-    let mut pi = 0usize;
-    let mut ni = 0usize;
-    let mut star: Option<(usize, usize)> = None; // (pi after '*', ni at the time)
-
-    while ni < n.len() {
-        if pi < p.len() && (p[pi] == '?' || ascii_eq_ci(p[pi], n[ni])) {
-            pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some((pi + 1, ni));
-            pi += 1;
-        } else if let Some((sp, sn)) = star {
-            pi = sp;
-            ni = sn + 1;
-            star = Some((sp, sn + 1));
-        } else {
-            return false;
-        }
-    }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
-}
-
-fn ascii_eq_ci(a: char, b: char) -> bool {
-    a.eq_ignore_ascii_case(&b)
 }
 
 // ---------------------------------------------------------------------------
@@ -769,7 +724,7 @@ impl Handle for LocalHandle {
                         if let Some(p) = pat.as_deref() {
                             // Empty / "*" / "*.*" all mean "match everything"
                             // in DOS-speak.
-                            if !(p.is_empty() || p == "*" || p == "*.*" || glob_match(p, &name)) {
+                            if !dos_pattern_matches(p, &name) {
                                 continue;
                             }
                         }
@@ -1188,19 +1143,6 @@ mod tests {
         assert_eq!(all.len(), 4);
 
         dir_h.close().await.unwrap();
-    }
-
-    #[test]
-    fn glob_match_basics() {
-        assert!(glob_match("*", "anything"));
-        assert!(glob_match("*.txt", "foo.txt"));
-        assert!(!glob_match("*.txt", "foo.log"));
-        assert!(glob_match("a?c", "abc"));
-        assert!(!glob_match("a?c", "ac"));
-        assert!(glob_match("a*b*c", "axxxbxxxc"));
-        assert!(glob_match("FOO", "foo"));
-        assert!(glob_match("", ""));
-        assert!(!glob_match("", "a"));
     }
 
     #[test]
